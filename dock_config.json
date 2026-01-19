@@ -1,0 +1,38 @@
+{
+  "debug": false,
+  "mode": "dock",
+  "input_file": null,
+  "output_file": null,
+  "translate": false,
+  "dx": 0.0,
+  "dy": 0.0,
+  "dz": 0.0,
+  "receptor_file": "C:\\Users\\10954\\Desktop\\protein_dock\\dock_20260104_191950_095\\best_conformation.pdb",
+  "ligand_file": "C:\\Users\\10954\\Desktop\\protein_dock\\dock_20260104_191950_095\\best_conformation.pdb",
+  "receptor_chains": [
+    "A"
+  ],
+  "ligand_chains": [
+    "B","C"
+  ],
+  "receptor_residues": [
+    "A:308"
+  ],
+  "ligand_residues": [
+    "C:501",
+    "C:502"
+  ],
+  "force_field": [
+    "data/force_field/ff14SB.xml",
+    "data/force_field/tip3p_standard.xml"
+  ],
+  "max_dist": 30,
+  "num_rotations": 36,
+  "use_gpu": true,
+  "step_size": 1,
+  "solvent_penalty_coeff": 1000,
+  "distance_penalty_coeff": 10000,
+  "optimal_distance": 10.0,
+  "save_all": false,
+  "num_output_confs": 1000
+}
