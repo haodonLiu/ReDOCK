@@ -10,6 +10,7 @@ from typing import List, Optional
 from src.models.structure import Structure
 from src.models.atom import PDBAtom
 from src.utils.logger import Logger
+from src.utils.structure_utils import residues_to_atom_indices
 
 
 class PDBParser:
@@ -33,8 +34,6 @@ class PDBParser:
             Structure: Parsed structure object
         """
         structure = Structure()
-        
-        self.logger.info(f"Opening PDB file: {file_path}")
         
         try:
             with open(file_path, 'r') as f:
@@ -89,7 +88,6 @@ class PDBParser:
         structure.align_to_standard_coordinate_system()
         
         self.logger.info(f"Parsing complete. Errors: {len(structure.errors)}, Warnings: {len(structure.warnings)}")
-        self.logger.info("Structure aligned to standard coordinate system: center at origin, principal vector along z-axis")
         return structure
     
     def _parse_atom_line(self, line: str, line_num: int, structure: Structure) -> bool:

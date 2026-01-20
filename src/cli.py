@@ -613,7 +613,6 @@ class PDBCLI:
         scored_conformations = docking.dock(
             parsed_args['receptor_residues'],
             parsed_args['ligand_residues'],
-            parsed_args['max_dist'],
             parsed_args['num_rotations']
         )
         
@@ -628,14 +627,9 @@ class PDBCLI:
         if not scored_conformations:
             self.logger.error("Error: No conformations generated. Please check if the specified residue groups exist in the PDB files.")
             return 1
-        
-        self.logger.info(f"Top 5 Best Conformation Scores:")
-        for i, (conf, score) in enumerate(scored_conformations[:5]):
-            self.logger.info(f"  Conformation {i+1}: Score = {score:.2f}")
-        
 
         # Get detailed score for the best conformation
-        best_conf = scored_conformations[0][0]
+        best_conf = scored_conformations[0]
         best_score, detailed_scores = docking.score_conformation(best_conf)
         
         # Calculate score breakdown percentages

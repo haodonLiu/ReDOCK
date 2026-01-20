@@ -8,7 +8,6 @@ Handles coordinate manipulation for PDB structures.
 
 import math
 import torch
-from typing import Tuple
 from src.models.structure import Structure
 
 
@@ -54,13 +53,13 @@ class CoordinateManager:
         # Normalize axis
         axis = axis / torch.norm(axis)
         
-        # Convert angle to radians directly from float
-        angle_rad = torch.tensor(math.radians(angle), device=self.device, dtype=torch.float16)
+        # Convert angle to radians with higher precision
+        angle_rad = torch.tensor(math.radians(angle), device=self.device, dtype=torch.float32)
         
         # Translate coordinates to origin
         coords_translated = coords - center
         
-        # Calculate rotation matrix using PyTorch
+        # Calculate rotation matrix using PyTorch with higher precision
         ux, uy, uz = axis
         cos_theta = torch.cos(angle_rad)
         sin_theta = torch.sin(angle_rad)
@@ -83,43 +82,14 @@ class CoordinateManager:
             torch.stack([r31, r32, r33])
         ])
         
-        # Apply rotation
-        coords_translated = coords_translated.to(torch.float16)
-        rotation_matrix = rotation_matrix.to(torch.float16)
+        # Apply rotation with higher precision
+        coords_translated = coords_translated.to(torch.float32)
+        rotation_matrix = rotation_matrix.to(torch.float32)
         coords_rotated = torch.matmul(coords_translated, rotation_matrix)
         
-        # Translate back
+        # Translate back and convert to original dtype
         coords_final = coords_rotated + center
+        coords_final = coords_final.to(self.structure.coordinates.dtype)
         
         # Directly update the tensor coordinates
         self.structure.coordinates = coords_final
-    
-    def apply_random_perturbation(self, translation_magnitude: float = 0.5, rotation_angle: float = 5.0, rotation_axis: torch.Tensor = None) -> None:
-        """
-        Apply random perturbation to the structure:
-        1. Random translation in X and Y axes (Z axis remains 0)
-        2. Random rotation around specified axis
-        
-        Args:
-            translation_magnitude (float): Maximum translation magnitude in Å (default: 0.5)
-            rotation_angle (float): Maximum rotation angle in degrees (default: 5.0)
-            rotation_axis (torch.Tensor): Rotation axis (default: Z-axis)
-        """
-        # Set default rotation axis if not provided
-        if rotation_axis is None:
-            rotation_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device)
-        
-        # Calculate rotation center (geometric center of structure)
-        center = torch.mean(self.structure.coordinates, dim=0)
-        
-        # 1. Apply random translation in X and Y axes (Z remains 0)
-        random_translation = torch.tensor([
-            (torch.rand(1, device=self.device) - 0.5) * 2 * translation_magnitude,
-            (torch.rand(1, device=self.device) - 0.5) * 2 * translation_magnitude,
-            0
-        ], device=self.device)
-        self.translate_coordinates(random_translation)
-        
-        # 2. Apply random rotation
-        random_angle = (torch.rand(1, device=self.device) - 0.5) * 2 * rotation_angle
-        self.rotate_around_axis(rotation_axis, random_angle.item(), center)
