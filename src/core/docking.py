@@ -6,13 +6,15 @@ PDB Docking Module
 Handles protein-protein docking conformation search with PyTorch acceleration.
 """
 
+import math
+from copy import deepcopy
 from typing import List, Tuple, Dict
 import torch
-from copy import deepcopy
-from src.models.structure import Structure
-from src.models.force_field import ForceField
+from src.core.alignment import calculate_rotation_parameters
 from src.core.coordinate_manager import CoordinateManager
 from src.core.energy_calculator import EnergyCalculator
+from src.models.force_field import ForceField
+from src.models.structure import Structure
 from src.utils.logger import Logger
 from src.utils.structure_utils import residues_to_atom_indices
 
@@ -131,7 +133,6 @@ class Docking:
             desired_vector = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=protein_vector.dtype)
         
         # Calculate rotation parameters
-        from src.core.alignment import calculate_rotation_parameters
         rotation_axis, angle = calculate_rotation_parameters(protein_vector, desired_vector, device=self.device)
         
         if rotation_axis is not None and angle > 1e-6:
@@ -195,6 +196,37 @@ class Docking:
         coords = structure.coordinates[atom_indices]
         return coords.mean(dim=0).to(self.device)
     
+    def _validate_ligand_orientation(self) -> bool:
+        """
+        Validate that the ligand protein vector is properly oriented towards the receptor residue group.
+        
+        Returns:
+            bool: True if ligand is properly oriented, False otherwise
+        """
+        # Calculate vectors
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+        ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+        
+        # Calculate ligand protein vector (from ligand center to ligand residue group)
+        ligand_protein_vector = ligand_group_center - ligand_geometric_center
+        
+        # Calculate vector from ligand residue group to receptor residue group
+        lig_to_rec_vector = receptor_group_center - ligand_group_center
+        
+        # Check if vectors are properly oriented using dot product
+        if torch.norm(ligand_protein_vector) > 1e-6 and torch.norm(lig_to_rec_vector) > 1e-6:
+            normalized_lig_protein_vector = ligand_protein_vector / torch.norm(ligand_protein_vector)
+            normalized_lig_to_rec_vector = lig_to_rec_vector / torch.norm(lig_to_rec_vector)
+            
+            dot_product = torch.dot(normalized_lig_protein_vector, normalized_lig_to_rec_vector)
+            
+            # If dot product is positive, ligand is facing away from receptor
+            # We want ligand to face receptor, so dot product should be negative
+            return dot_product < 0
+        
+        return True
+
     @property
     def receptor_center(self) -> torch.Tensor:
         """
@@ -248,8 +280,8 @@ class Docking:
         
         The alignment ensures:
         1. Protein vector (center to residue group center) aligns with z-axis
-        2. Initially overlap protein centers
-        3. Gradually increase distance along z-axis until appropriate separation
+        2. Directly positions ligand near receptor residue group (2-5Å range)
+        3. Ensures ligand residue group faces receptor residue group
         4. Preserve internal geometric relationships within each protein
         """
         if not self.receptor or not self.ligand:
@@ -276,53 +308,161 @@ class Docking:
         self.logger.info(f"Ligand length: {lig_length:.4f} Å")
 
         # --------------------------
-        # Step 4: Gradually increase distance along z-axis
+        # Step 4: Position ligand near receptor residue group
         # --------------------------
-        step_size = 0.2  
-        current_distance = torch.norm(self.receptor_center - self.ligand_center).item()
-        self.logger.info(f"Current distance: {current_distance:.4f} Å")
-        
         # Create coordinate manager for ligand
         coord_manager = CoordinateManager(self.ligand, device=self.device)
         
-        # Gradually increase distance along positive z-axis
-        max_iterations = 10000  # Safety counter to prevent infinite loops
-        iteration = 0
+        # Calculate receptor residue group center
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
         
-        while iteration < max_iterations:
-            # Calculate translation vector along positive z-axis
-            translation = torch.tensor([0.0, 0.0, step_size], device=self.device, dtype=torch.float16)
+        # Calculate ligand residue group center (relative to ligand center)
+        ligand_group_center_local = self.calculate_center(self.ligand, self.ligand_group) - self.ligand_center
+        
+        # Position ligand such that its residue group is near receptor residue group with safe initial distance
+        # Start with a much larger offset to avoid atom overlap
+        base_target_position = receptor_group_center - ligand_group_center_local
+        
+        # Try multiple initial offsets to find a safe starting position
+        safe_offset_found = False
+        # Try larger initial offsets first
+        for offset_z in [20.0, 15.0, 10.0, 8.0, 6.0]:
+            # Add offset along positive z-axis
+            offset = torch.tensor([0.0, 0.0, offset_z], device=self.device)
+            target_position = base_target_position + offset
+            current_ligand_center = self.ligand_center
+            translation = target_position - current_ligand_center
             coord_manager.translate_coordinates(translation)
             
-            # Update current distance
-            current_distance = torch.norm(self.receptor_center - self.ligand_center).item()
+            # Calculate initial vdw energy
+            initial_vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            self.logger.info(f"Testing offset {offset_z}Å: VDW energy = {initial_vdw_energy:.2f} kcal/mol")
             
-            # Calculate vdw energy
-            vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-            
-            # Check if vdw energy is below threshold or distance is sufficient
-            if vdw_energy == float('nan'):
-                continue
-            if vdw_energy < 10000:
-                step_size = max(0.01,step_size*0.9)
-            if vdw_energy < 0:
-                self.logger.info(f"Stopping distance increase: vdw_energy = {vdw_energy:.2f}, current_distance = {current_distance:.4f} Å")
+            # If vdw energy is reasonable for total protein interaction, use this position
+            # For large proteins, total VDW can be positive but manageable
+            if initial_vdw_energy < 50000 and not math.isnan(initial_vdw_energy):
+                safe_offset_found = True
+                self.logger.info(f"Using initial offset of {offset_z}Å with VDW energy: {initial_vdw_energy:.2f} kcal/mol")
                 break
-            if iteration % 50 == 0:
-                self.logger.info(f"Iteration {iteration}: distance = {current_distance:.4f} Å, vdw_energy = {vdw_energy:.2f}")
-            iteration += 1
+            
+            # If energy is still too high, try a different offset
+            # Reset position first
+            coord_manager.translate_coordinates(-translation)
         
-        if iteration >= max_iterations:
-            self.logger.warning(f"Reached maximum iterations ({max_iterations}) without meeting stopping criteria")
+        if not safe_offset_found:
+            # If no safe offset found, use the largest offset and let the adjustment logic handle it
+            offset = torch.tensor([0.0, 0.0, 20.0], device=self.device)
+            target_position = base_target_position + offset
+            current_ligand_center = self.ligand_center
+            translation = target_position - current_ligand_center
+            coord_manager.translate_coordinates(translation)
+            initial_vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            self.logger.warning(f"Could not find safe initial offset. Using 20Å offset with VDW energy: {initial_vdw_energy:.2f} kcal/mol")
+        
+        # Calculate initial vdw energy again after final positioning
+        initial_vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+        self.logger.info(f"Final initial VDW energy: {initial_vdw_energy:.2f} kcal/mol")
+        
+        # If vdw energy is too high (>50000) or nan, adjust position
+        if initial_vdw_energy > 50000 or math.isnan(initial_vdw_energy):
+            self.logger.info("Initial position has high VDW energy. Adjusting...")
+            
+            # Try small adjustments in different directions
+            adjustment_directions = [
+                torch.tensor([0.0, 0.0, 2.0], device=self.device),  # Move along positive z-axis
+                torch.tensor([0.0, 0.0, -2.0], device=self.device),  # Move along negative z-axis
+                torch.tensor([1.0, 1.0, 1.0], device=self.device) / torch.sqrt(torch.tensor(3.0)),  # Diagonal
+                torch.tensor([-1.0, -1.0, -1.0], device=self.device) / torch.sqrt(torch.tensor(3.0)),  # Opposite diagonal
+                torch.tensor([1.0, 0.0, 0.0], device=self.device),  # Move along x-axis
+                torch.tensor([0.0, 1.0, 0.0], device=self.device)   # Move along y-axis
+            ]
+            
+            best_vdw_energy = initial_vdw_energy
+            best_translation = torch.zeros(3, device=self.device)
+            
+            for direction in adjustment_directions:
+                # Try adjustment with different distances
+                for distance in [1.0, 2.0, 3.0]:
+                    # Save current position
+                    current_coords = self.ligand.coordinates.clone()
+                    
+                    # Apply adjustment
+                    adjust_translation = direction * distance
+                    coord_manager.translate_coordinates(adjust_translation)
+                    
+                    # Calculate vdw energy
+                    vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                    
+                    # Check if this is better
+                    if vdw_energy < best_vdw_energy:
+                        best_vdw_energy = vdw_energy
+                        best_translation = adjust_translation
+                    
+                    # Restore position
+                    self.ligand.coordinates = current_coords.clone()
+            
+            # Apply best adjustment
+            if best_vdw_energy < initial_vdw_energy:
+                self.logger.info(f"Applying adjustment of {torch.norm(best_translation).item():.2f} Å, new VDW energy: {best_vdw_energy:.2f} kcal/mol")
+                coord_manager.translate_coordinates(best_translation)
+            else:
+                self.logger.warning(f"Could not find better position. Using initial position with VDW energy: {initial_vdw_energy:.2f} kcal/mol")
         
         # --------------------------
         # Step 5: Final verification
         # --------------------------
-        actual_distance = torch.norm(self.receptor_center - self.ligand_center).item()
+        # Calculate final positions
+        final_receptor_center = self.receptor_center
+        final_ligand_center = self.ligand_center
+        final_receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+        
+        # Calculate distance between residue groups and protein centers
+        group_distance = torch.norm(final_receptor_group_center - final_ligand_group_center).item()
+        center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+        
+        # Calculate final vdw energy
+        final_vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+        
+        # Ensure residue group distance is less than protein center distance
+        # If not, adjust ligand position
+        coord_manager = CoordinateManager(self.ligand, device=self.device)
+        adjustment_applied = False
+        
+        if group_distance >= center_distance:
+            self.logger.info(f"Residue group distance ({group_distance:.4f} Å) >= protein center distance ({center_distance:.4f} Å), adjusting ligand position")
+            
+            # Calculate direction from ligand center to ligand residue group
+            ligand_residue_dir = final_ligand_group_center - final_ligand_center
+            ligand_residue_dir_normalized = ligand_residue_dir / torch.norm(ligand_residue_dir)
+            
+            # Move ligand in the direction away from its residue group relative to receptor
+            # This will increase the protein center distance while keeping residue group distance similar
+            adjustment_distance = center_distance - group_distance + 2.0  # Add 2Å buffer
+            adjustment = ligand_residue_dir_normalized * adjustment_distance
+            
+            # Apply adjustment
+            coord_manager.translate_coordinates(adjustment)
+            adjustment_applied = True
+            
+            # Recalculate distances after adjustment
+            final_receptor_center = self.receptor_center
+            final_ligand_center = self.ligand_center
+            final_receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+            final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            
+            group_distance = torch.norm(final_receptor_group_center - final_ligand_group_center).item()
+            center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+            final_vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            
+            self.logger.info(f"After adjustment: Residue group distance = {group_distance:.4f} Å, Protein center distance = {center_distance:.4f} Å")
+        
         self.logger.info("=== Final Position ===")
-        self.logger.info(f"Receptor center: ({self.receptor_center[0]:.4f}, {self.receptor_center[1]:.4f}, {self.receptor_center[2]:.4f})")
-        self.logger.info(f"Ligand center: ({self.ligand_center[0]:.4f}, {self.ligand_center[1]:.4f}, {self.ligand_center[2]:.4f})")
-        self.logger.info(f"Distance between centers: {actual_distance:.4f} Å")
+        self.logger.info(f"Receptor center: ({final_receptor_center[0]:.4f}, {final_receptor_center[1]:.4f}, {final_receptor_center[2]:.4f})")
+        self.logger.info(f"Ligand center: ({final_ligand_center[0]:.4f}, {final_ligand_center[1]:.4f}, {final_ligand_center[2]:.4f})")
+        self.logger.info(f"Distance between centers: {center_distance:.4f} Å")
+        self.logger.info(f"Distance between residue groups: {group_distance:.4f} Å")
+        self.logger.info(f"Final VDW energy: {final_vdw_energy:.2f}")
         
         # Verify protein vector directions
         rec_vector = self.rec_group_center  # Since receptor is at origin
@@ -330,6 +470,15 @@ class Docking:
         
         self.logger.info(f"Receptor vector direction: ({rec_vector[0]:.4f}, {rec_vector[1]:.4f}, {rec_vector[2]:.4f})")
         self.logger.info(f"Ligand vector direction: ({lig_vector[0]:.4f}, {lig_vector[1]:.4f}, {lig_vector[2]:.4f})")
+        
+        # Final verification: Ensure residue group distance < ligand center to receptor residue group distance
+        ligand_to_receptor_group = torch.norm(final_ligand_center - final_receptor_group_center).item()
+        self.logger.info(f"Ligand center to receptor residue group distance: {ligand_to_receptor_group:.4f} Å")
+        
+        if group_distance < ligand_to_receptor_group:
+            self.logger.info(f"✓ Residue group distance ({group_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+        else:
+            self.logger.warning(f"⚠ Residue group distance ({group_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
     
     def generate_initial_conformations(self, num_conformations: int = 36) -> None:
         """
@@ -376,7 +525,6 @@ class Docking:
         # Generate and evaluate conformations
         for i, angle_deg in enumerate(angles):
             # Convert angle to radians
-            import math
             angle_rad = math.radians(angle_deg)
             
             # Calculate target position on xz plane
@@ -391,6 +539,19 @@ class Docking:
             
             # Move ligand to target position
             coord_manager.translate_coordinates(translation)
+            
+            # Validate ligand orientation before evaluating conformation
+            if not self._validate_ligand_orientation():
+                # Try to correct orientation by rotating 180 degrees around y-axis
+                flip_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+                coord_manager.rotate_around_axis(flip_axis, 180.0, ligand_geometric_center)
+                
+                # Check again if orientation is valid
+                if not self._validate_ligand_orientation():
+                    # Reset to original position for next iteration
+                    self.ligand.coordinates = original_position.clone()
+                    continue
             
             # Evaluate conformation
             vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
@@ -408,7 +569,7 @@ class Docking:
                 self.logger.info(f"Conformation {i+1}/{num_conformations-1}: Angle = {angle_deg:.1f}°, VDW = {vdw_energy:.2f}, Distance = {group_distance:.4f} Å, Score = {score:.2f}")
             
             # Update best conformation
-            if score < best_score and vdw_energy < 1000.0:
+            if score < best_score and vdw_energy < 50000.0:
                 best_score = score
                 best_conformation = self.ligand.coordinates.clone()
                 best_position = target_position
@@ -435,8 +596,7 @@ class Docking:
     def optimize_position(self) -> None:
         """
         Optimize ligand position in 3D space to align with receptor target group.
-        Simulates ligand being pulled towards receptor target group while searching along the surface,
-        ensuring van der Waals energy stays below 1000 and ligand remains rigid.
+        Moves ligand towards receptor target group while ensuring van der Waals energy stays reasonable.
         """
         if not self.receptor or not self.ligand:
             raise ValueError("Receptor or ligand structure is None")
@@ -447,143 +607,291 @@ class Docking:
         self.logger.info("===== Optimizing Ligand Position =====")
         
         # Get receptor and ligand group centers
-        receptor_center = self.calculate_center(self.receptor, self.receptor_group)
-        ligand_center = self.calculate_center(self.ligand, self.ligand_group)
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        initial_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
         
-        self.logger.info(f"Initial receptor group center: ({receptor_center[0]:.4f}, {receptor_center[1]:.4f}, {receptor_center[2]:.4f})")
-        self.logger.info(f"Initial ligand group center: ({ligand_center[0]:.4f}, {ligand_center[1]:.4f}, {ligand_center[2]:.4f})")
+        self.logger.info(f"Initial receptor group center: ({receptor_group_center[0]:.4f}, {receptor_group_center[1]:.4f}, {receptor_group_center[2]:.4f})")
+        self.logger.info(f"Initial ligand group center: ({initial_ligand_group_center[0]:.4f}, {initial_ligand_group_center[1]:.4f}, {initial_ligand_group_center[2]:.4f})")
         
         # Create coordinate manager for ligand
         coord_manager = CoordinateManager(self.ligand, device=self.device)
         
         # Initial distance and energy
-        initial_distance = torch.norm(receptor_center - ligand_center).item()
+        initial_distance = torch.norm(receptor_group_center - initial_ligand_group_center).item()
         initial_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
         
         self.logger.info(f"Initial distance: {initial_distance:.4f} Å")
         self.logger.info(f"Initial VDW energy: {initial_vdw:.2f}")
         
         # Optimization parameters
-        max_iterations = 10000
-        step_size = 0.1
-        min_step_size = 0.01
-        vdw_threshold = 10000.0
-        distance_threshold = 0.5
+        max_iterations = 300
+        step_size = 0.5  # Small step size to avoid sudden collisions
+        min_step_size = 0.1
+        vdw_threshold = 50000.0  # Higher threshold for initial approach
+        target_distance = 6.0  # Target distance for residue groups
         
         best_distance = initial_distance
         best_position = self.ligand.coordinates.clone()
         best_vdw = initial_vdw
         
-        # Counter for steps without improvement
-        no_improvement_steps = 0
-        
+        # Start moving towards receptor
         for iteration in range(max_iterations):
-            # Calculate direction vector from ligand to receptor
-            current_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
-            direction = receptor_center - current_ligand_center
+            # Calculate current ligand group center
+            current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            
+            # Calculate direction vector from ligand to receptor group
+            direction = receptor_group_center - current_ligand_group_center
             direction_norm = torch.norm(direction)
             
-            if direction_norm < 1e-6:
-                self.logger.info("Ligand is already at receptor target group center")
+            if direction_norm < target_distance:
+                self.logger.info(f"Converged: Distance below target ({direction_norm:.4f} Å)")
                 break
             
             # Normalize direction vector
             direction_normalized = direction / direction_norm
             
-            # Check if we need to apply reverse force
-            if no_improvement_steps >= 100:
-                self.logger.info(f"Applying reverse force to ligand (no improvement for {no_improvement_steps} steps)")
-                # Apply reverse force - move ligand away from receptor
-                reverse_step = -direction_normalized * (step_size * 5)
-                coord_manager.translate_coordinates(reverse_step)
-                # Reset counter
-                no_improvement_steps = 0
-                
-                # Log reverse force application
-                new_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
-                new_distance = torch.norm(receptor_center - new_ligand_center).item()
-                new_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-                self.logger.info(f"After reverse force: Distance = {new_distance:.4f} Å, VDW = {new_vdw:.2f}")
-                continue
+            # Ensure ligand protein vector continues to face the receptor residue group
+            # Calculate ligand geometric center
+            ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
             
-            # Calculate step vector with adaptive step size
-            step_vector = direction_normalized * step_size
+            # Calculate ligand protein vector (from ligand center to ligand residue group)
+            ligand_protein_vector = current_ligand_group_center - ligand_geometric_center
+            
+            # Calculate vector from ligand to receptor residue group
+            lig_to_rec_vector = receptor_group_center - current_ligand_group_center
+            
+            # Check orientation using dot product
+            if torch.norm(ligand_protein_vector) > 1e-6 and torch.norm(lig_to_rec_vector) > 1e-6:
+                normalized_lig_protein_vector = ligand_protein_vector / torch.norm(ligand_protein_vector)
+                normalized_lig_to_rec_vector = lig_to_rec_vector / torch.norm(lig_to_rec_vector)
+                
+                dot_product = torch.dot(normalized_lig_protein_vector, normalized_lig_to_rec_vector)
+                
+                # If dot product is positive, ligand protein vector is facing away from receptor
+                if dot_product > 0:
+                    # Rotate 180 degrees around y-axis to correct orientation
+                    flip_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                    coord_manager.rotate_around_axis(flip_axis, 180.0, ligand_geometric_center)
+                    
+                    # Recalculate after rotation
+                    current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                    direction = receptor_group_center - current_ligand_group_center
+                    direction_norm = torch.norm(direction)
+                    if direction_norm < target_distance:
+                        self.logger.info(f"Converged: Distance below target ({direction_norm:.4f} Å)")
+                        break
+                    direction_normalized = direction / direction_norm
             
             # Save current position
             current_position = self.ligand.coordinates.clone()
             
-            # Move ligand in the direction of receptor
+            # Calculate step vector
+            step_vector = direction_normalized * step_size
+            
+            # Move ligand towards receptor
             coord_manager.translate_coordinates(step_vector)
             
             # Calculate new distance and energy
-            new_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
-            new_distance = torch.norm(receptor_center - new_ligand_center).item()
+            new_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            new_distance = torch.norm(receptor_group_center - new_ligand_group_center).item()
             new_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
             
-            # Check if new position is better
-            if new_vdw <= vdw_threshold:
-                # Good position, update best
+            # Handle NaN vdw energy (usually due to exact atom overlap)
+            if math.isnan(new_vdw):
+                self.logger.warning("Got NaN VDW energy, reverting position")
+                self.ligand.coordinates = current_position
+                # Try smaller step size
+                step_size = max(step_size * 0.5, min_step_size)
+                continue
+            
+            # Check if position is acceptable
+            if new_vdw < vdw_threshold:
+                # Update best position if closer and VDW is reasonable
                 if new_distance < best_distance:
                     best_distance = new_distance
                     best_position = self.ligand.coordinates.clone()
                     best_vdw = new_vdw
-                    # Reset no improvement counter
-                    no_improvement_steps = 0
-                else:
-                    # No improvement
-                    no_improvement_steps += 1
+                    
+                    # Log improvement
+                    if iteration % 50 == 0:
+                        self.logger.info(f"Iteration {iteration}: Distance = {new_distance:.4f} Å, VDW = {new_vdw:.2f}, Step size = {step_size:.4f}")
                 
-                # Adjust step size based on progress
-                if new_distance < best_distance * 0.9:
-                    step_size = min(step_size * 1.1, 0.5)
-                else:
+                # Gradually reduce step size as we get closer
+                if new_distance < best_distance * 0.95:
                     step_size = max(step_size * 0.9, min_step_size)
             else:
-                # Bad position, revert
+                # Position not acceptable, revert and try smaller step
                 self.ligand.coordinates = current_position
-                # Reduce step size and try different direction
-                step_size = max(step_size * 0.5, min_step_size)
+                step_size = max(step_size * 0.7, min_step_size)
                 
-                # Try slight lateral movement to avoid collision
-                lateral_direction = torch.tensor([direction_normalized[1], -direction_normalized[0], 0.0], 
-                                               device=self.device, dtype=direction_normalized.dtype)
-                lateral_step = lateral_direction * step_size
-                coord_manager.translate_coordinates(lateral_step)
-                
-                # Check lateral position
-                lateral_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-                if lateral_vdw > vdw_threshold:
-                    # Revert if lateral also bad
-                    self.ligand.coordinates = current_position
-                
-                # Increment no improvement counter
-                no_improvement_steps += 1
+                # If still too high, try lateral movement
+                if step_size <= min_step_size:
+                    # Try slight lateral movement to find better path
+                    found_better_path = False
+                    for angle in [-20.0, 20.0]:
+                        # Rotate direction vector slightly
+                        angle_rad = math.radians(angle)
+                        rotated_direction = torch.tensor([
+                            direction_normalized[0] * math.cos(angle_rad) - direction_normalized[1] * math.sin(angle_rad),
+                            direction_normalized[0] * math.sin(angle_rad) + direction_normalized[1] * math.cos(angle_rad),
+                            direction_normalized[2]
+                        ], device=self.device)
+                        
+                        # Try this direction
+                        lateral_step = rotated_direction * step_size
+                        coord_manager.translate_coordinates(lateral_step)
+                        
+                        lateral_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                        lateral_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
+                        lateral_distance = torch.norm(receptor_group_center - lateral_ligand_center).item()
+                        
+                        if lateral_vdw < vdw_threshold and lateral_distance < best_distance:
+                            # Found better path
+                            best_distance = lateral_distance
+                            best_position = self.ligand.coordinates.clone()
+                            best_vdw = lateral_vdw
+                            found_better_path = True
+                            break
+                        else:
+                            # Revert
+                            self.ligand.coordinates = current_position
+                    
+                    if not found_better_path:
+                        # No better path found, break early
+                        break
             
-            # Log progress every 100 iterations
-            if iteration % 100 == 0:
-                current_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
-                current_distance = torch.norm(receptor_center - current_ligand_center).item()
-                current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-                self.logger.info(f"Iteration {iteration}: Distance = {current_distance:.4f} Å, VDW = {current_vdw:.2f}, Step size = {step_size:.4f}, No improvement steps = {no_improvement_steps}")
-            
-            # Check if converged
-            if best_distance < distance_threshold:
-                self.logger.info(f"Converged: Distance below threshold ({best_distance:.4f} Å)")
+            # Check if we've reached target distance
+            if best_distance < target_distance:
                 break
         
         # Set best position
         self.ligand.coordinates = best_position
         
-        # Final verification
-        final_ligand_center = self.calculate_center(self.ligand, self.ligand_group)
-        final_distance = torch.norm(receptor_center - final_ligand_center).item()
+        # Final verification and adjustment
+        final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+        final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
         final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
         
+        # If final VDW is still too high, move slightly away
+        if final_vdw > vdw_threshold:
+            self.logger.info(f"Final VDW energy ({final_vdw:.2f}) is too high, adjusting...")
+            # Calculate direction away from receptor
+            direction_away = final_ligand_group_center - receptor_group_center
+            direction_away_normalized = direction_away / torch.norm(direction_away)
+            
+            # Move in small steps until VDW is acceptable
+            for adjust_step in [0.5, 1.0, 1.5, 2.0, 3.0]:
+                adjustment = direction_away_normalized * adjust_step
+                coord_manager.translate_coordinates(adjustment)
+                
+                adjusted_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                adjusted_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                adjusted_distance = torch.norm(receptor_group_center - adjusted_ligand_group_center).item()
+                
+                if adjusted_vdw < vdw_threshold:
+                    final_vdw = adjusted_vdw
+                    final_distance = adjusted_distance
+                    final_ligand_group_center = adjusted_ligand_group_center
+                    self.logger.info(f"Adjusted position: Distance = {final_distance:.4f} Å, VDW = {final_vdw:.2f}")
+                    break
+        
+        # Ensure residue group distance < protein center distance
+        final_receptor_center = self.receptor_center
+        final_ligand_center = self.ligand_center
+        center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+        
+        if final_distance >= center_distance:
+            self.logger.info(f"Residue group distance ({final_distance:.4f} Å) >= protein center distance ({center_distance:.4f} Å), adjusting ligand position")
+            
+            # Calculate the vector from ligand residue group to ligand geometric center
+            # We'll move the ligand so that its residue group is closer to its geometric center
+            ligand_residue_to_center = final_ligand_center - final_ligand_group_center
+            
+            # Apply this vector to move the ligand's residue group towards its geometric center
+            # This will increase the protein center distance while keeping the residue group distance similar
+            coord_manager.translate_coordinates(ligand_residue_to_center)
+            
+            # Recalculate distances after adjustment
+            final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
+            final_receptor_center = self.receptor_center
+            final_ligand_center = self.ligand_center
+            center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            
+            self.logger.info(f"After adjustment: Residue group distance = {final_distance:.4f} Å, Protein center distance = {center_distance:.4f} Å, VDW = {final_vdw:.2f}")
+            
+            # If still not satisfied, move ligand further away from receptor
+            if final_distance >= center_distance:
+                # Calculate direction from receptor to ligand
+                away_dir = final_ligand_center - final_receptor_center
+                away_dir_normalized = away_dir / torch.norm(away_dir)
+                
+                # Move ligand further away
+                additional_adjustment = away_dir_normalized * 5.0
+                coord_manager.translate_coordinates(additional_adjustment)
+                
+                # Recalculate distances again
+                final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
+                final_receptor_center = self.receptor_center
+                final_ligand_center = self.ligand_center
+                center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+                final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                
+                self.logger.info(f"After moving ligand further away: Residue group distance = {final_distance:.4f} Å, Protein center distance = {center_distance:.4f} Å, VDW = {final_vdw:.2f}")
+        
+        # Calculate distances for verification
+        final_receptor_center = self.receptor_center
+        final_ligand_center = self.ligand_center
+        center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
+        
+        # Calculate ligand center to receptor residue group distance
+        ligand_to_receptor_group = torch.norm(final_ligand_center - receptor_group_center).item()
+        
         self.logger.info("=== Final Position ===")
-        self.logger.info(f"Final receptor group center: ({receptor_center[0]:.4f}, {receptor_center[1]:.4f}, {receptor_center[2]:.4f})")
-        self.logger.info(f"Final ligand group center: ({final_ligand_center[0]:.4f}, {final_ligand_center[1]:.4f}, {final_ligand_center[2]:.4f})")
-        self.logger.info(f"Final distance: {final_distance:.4f} Å")
+        self.logger.info(f"Final receptor group center: ({receptor_group_center[0]:.4f}, {receptor_group_center[1]:.4f}, {receptor_group_center[2]:.4f})")
+        self.logger.info(f"Final ligand group center: ({final_ligand_group_center[0]:.4f}, {final_ligand_group_center[1]:.4f}, {final_ligand_group_center[2]:.4f})")
+        self.logger.info(f"Final residue group distance: {final_distance:.4f} Å")
+        self.logger.info(f"Final protein center distance: {center_distance:.4f} Å")
+        self.logger.info(f"Final ligand center to receptor residue group distance: {ligand_to_receptor_group:.4f} Å")
         self.logger.info(f"Final VDW energy: {final_vdw:.2f}")
+        
+        # Verify residue group distance < ligand center to receptor residue group distance
+        if final_distance < ligand_to_receptor_group:
+            self.logger.info(f"✓ Residue group distance ({final_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+        else:
+            self.logger.warning(f"⚠ Residue group distance ({final_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Adjusting ligand position")
+            
+            # Calculate adjustment vector to move ligand so that residue group distance < ligand center to receptor residue group distance
+            # We'll move ligand further away from receptor residue group
+            direction = final_ligand_group_center - receptor_group_center
+            direction_normalized = direction / torch.norm(direction)
+            
+            # Calculate required adjustment distance to satisfy the condition
+            # We need to ensure that ligand_to_receptor_group > final_distance
+            # Let's solve for adjustment distance d:
+            # |ligand_center + d*direction_normalized - receptor_group_center| > |final_ligand_group_center + d*direction_normalized - receptor_group_center|
+            # For simplicity, we'll move ligand far enough to ensure the condition is met
+            required_distance = final_distance * 1.5  # Move far enough to ensure condition is met
+            adjustment = direction_normalized * required_distance
+            
+            # Apply adjustment
+            coord_manager.translate_coordinates(adjustment)
+            
+            # Recalculate distances after adjustment
+            final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
+            final_ligand_center = self.ligand_center
+            ligand_to_receptor_group = torch.norm(final_ligand_center - receptor_group_center).item()
+            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            
+            self.logger.info(f"After adjustment: Residue group distance = {final_distance:.4f} Å, Ligand center to receptor residue group distance = {ligand_to_receptor_group:.4f} Å, VDW = {final_vdw:.2f}")
+            
+            if final_distance < ligand_to_receptor_group:
+                self.logger.info(f"✓ After adjustment: Residue group distance ({final_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+            else:
+                self.logger.warning(f"⚠ Even after adjustment, residue group distance ({final_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
         
         if final_vdw > vdw_threshold:
             self.logger.warning(f"Final VDW energy ({final_vdw:.2f}) exceeds threshold ({vdw_threshold:.2f})")
@@ -609,9 +917,247 @@ class Docking:
         ligand_copy.total_charge = base_ligand.total_charge
         return ligand_copy
     
-    def search_conformations(self, num_rotations: int = 360) -> List[Structure]:
+    def _translation_scan(self, step_size: float, distance_range: Tuple[float, float], vdw_threshold: float = 10000.0) -> List[Structure]:
         """
-        Search for docking conformations by rotating ligand around z-axis.
+        Perform systematic translation scan of ligand around receptor residue group.
+        
+        Args:
+            step_size (float): Translation step size in Å
+            distance_range (Tuple[float, float]): Min and max distance from receptor residue group
+            vdw_threshold (float): VDW energy threshold for collision detection
+            
+        Returns:
+            List[Structure]: List of valid conformations from translation scan
+        """
+        self.logger.info(f"=== Translation Scan (Step size: {step_size} Å) ===")
+        
+        conformations = []
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        
+        # Calculate ligand residue group position relative to ligand geometric center
+        ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+        ligand_group_offset = self.calculate_center(self.ligand, self.ligand_group) - ligand_geometric_center
+        
+        # Generate grid of positions around receptor residue group
+        min_dist, max_dist = distance_range
+        grid_size = int((max_dist - min_dist) / step_size) + 1
+        
+        # Save original ligand position
+        original_position = self.ligand.coordinates.clone()
+        
+        # Create coordinate manager
+        coord_manager = CoordinateManager(self.ligand, device=self.device)
+        
+        # Generate positions around receptor residue group
+        for i in range(grid_size):
+            for j in range(grid_size):
+                for k in range(grid_size):
+                    # Calculate position offset from receptor residue group
+                    dx = (i - grid_size//2) * step_size
+                    dy = (j - grid_size//2) * step_size
+                    dz = (k - grid_size//2) * step_size
+                    
+                    # Calculate target ligand residue group position
+                    target_ligand_group_position = receptor_group_center + torch.tensor([dx, dy, dz], device=self.device)
+                    
+                    # Calculate required ligand geometric center position
+                    target_ligand_center = target_ligand_group_position - ligand_group_offset
+                    
+                    # Calculate translation vector to move ligand to this position
+                    translation = target_ligand_center - ligand_geometric_center
+                    
+                    # Apply translation
+                    self.ligand.coordinates = original_position.clone()
+                    coord_manager.translate_coordinates(translation)
+                    
+                    # Calculate current distance from receptor residue group
+                    current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                    current_distance = torch.norm(receptor_group_center - current_ligand_group_center).item()
+                    
+                    # Check if within distance range
+                    if current_distance < min_dist or current_distance > max_dist:
+                        continue
+                    
+                    # Validate ligand orientation
+                    if not self._validate_ligand_orientation():
+                        # Try to correct orientation by rotating 180 degrees around y-axis
+                        ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+                        CoordinateManager(self.ligand, device=self.device).rotate_around_axis(
+                            torch.tensor([0.0, 1.0, 0.0], device=self.device),
+                            180.0,
+                            ligand_geometric_center
+                        )
+                        
+                        # Check if orientation is now valid
+                        if not self._validate_ligand_orientation():
+                            continue
+                    
+                    # Calculate VDW energy
+                    vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                    
+                    # Get centers for distance calculations
+                    receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+                    ligand_center = self.ligand.calculate_geometric_center().to(self.device)
+                    ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                    
+                    # Calculate distances
+                    ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
+                    residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+                    
+                    # Check if VDW energy is within threshold and distance condition is met
+                    if vdw_energy < 1e5 and ligand_to_receptor_group > residue_group_distance and not math.isnan(vdw_energy):
+                        # Create copy of valid conformation
+                        valid_conformation = self._create_ligand_copy(self.ligand)
+                        conformations.append(valid_conformation)
+        
+        self.logger.info(f"Found {len(conformations)} valid conformations from translation scan")
+        
+        # Restore original ligand position
+        self.ligand.coordinates = original_position.clone()
+        
+        return conformations
+
+    def _rotation_scan(self, conformations: List[Structure], num_rotations: int = 36, vdw_threshold: float = 10000.0) -> List[Structure]:
+        """
+        Perform rotation scan on valid conformations from translation scan.
+        
+        Args:
+            conformations (List[Structure]): List of valid conformations from translation scan
+            num_rotations (int): Number of rotations per conformation
+            vdw_threshold (float): VDW energy threshold for collision detection
+            
+        Returns:
+            List[Structure]: List of valid conformations after rotation scan
+        """
+        self.logger.info(f"=== Rotation Scan (Rotations: {num_rotations}) ===")
+        
+        rotated_conformations = []
+        rotation_axis = torch.tensor([0.0, 0.0, -1.0], device=self.device)  # Rotate around z-axis
+        rotation_step = 360.0 / num_rotations
+        
+        for base_conformation in conformations:
+            # Calculate rotation center (ligand geometric center)
+            ligand_center = base_conformation.calculate_geometric_center().to(self.device)
+            
+            # Generate rotations
+            for i in range(num_rotations):
+                # Create copy of base conformation
+                ligand_copy = self._create_ligand_copy(base_conformation)
+                
+                # Apply rotation
+                angle = i * rotation_step
+                CoordinateManager(ligand_copy, device=self.device).rotate_around_axis(rotation_axis, angle, ligand_center)
+                
+                # Calculate VDW energy
+                vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, ligand_copy)
+                
+                # Get centers for distance calculations
+                receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+                ligand_center = ligand_copy.calculate_geometric_center().to(self.device)
+                ligand_group_center = self.calculate_center(ligand_copy, self.ligand_group)
+                
+                # Calculate distances
+                ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
+                residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+                
+                # Check if VDW energy is within threshold and distance condition is met
+                if vdw_energy < 1e5 and ligand_to_receptor_group > residue_group_distance and not math.isnan(vdw_energy):
+                    # Validate orientation after rotation
+                    # Temporarily set ligand to this conformation for validation
+                    original_coords = self.ligand.coordinates.clone()
+                    self.ligand.coordinates = ligand_copy.coordinates.clone()
+                    
+                    if self._validate_ligand_orientation():
+                        rotated_conformations.append(ligand_copy)
+                    
+                    # Restore original ligand position
+                    self.ligand.coordinates = original_coords.clone()
+        
+        self.logger.info(f"Found {len(rotated_conformations)} valid conformations after rotation scan")
+        return rotated_conformations
+
+    def _fine_grained_optimization(self, conformations: List[Structure], step_size: float = 0.1, vdw_threshold: float = 10000.0) -> List[Structure]:
+        """
+        Perform fine-grained optimization on valid conformations.
+        
+        Args:
+            conformations (List[Structure]): List of valid conformations to optimize
+            step_size (float): Fine optimization step size in Å
+            vdw_threshold (float): VDW energy threshold for collision detection
+            
+        Returns:
+            List[Structure]: List of optimized conformations
+        """
+        self.logger.info(f"=== Fine-Grained Optimization (Step size: {step_size} Å) ===")
+        
+        optimized_conformations = []
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        
+        for conformation in conformations:
+            # Save original conformation
+            optimized_conformation = self._create_ligand_copy(conformation)
+            
+            # Create coordinate manager for this conformation
+            coord_manager = CoordinateManager(optimized_conformation, device=self.device)
+            
+            # Get initial score
+            initial_score, _ = self.score_conformation(optimized_conformation, include_vdw=True, include_distance=True, distance_weight=1000.0)
+            best_score = initial_score
+            best_coords = optimized_conformation.coordinates.clone()
+            
+            # Try small translations in all directions
+            for dx in [-step_size, 0.0, step_size]:
+                for dy in [-step_size, 0.0, step_size]:
+                    for dz in [-step_size, 0.0, step_size]:
+                        # Skip zero translation
+                        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+                            continue
+                        
+                        # Apply translation
+                        translation = torch.tensor([dx, dy, dz], device=self.device)
+                        coord_manager.translate_coordinates(translation)
+                        
+                        # Calculate VDW energy
+                        vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, optimized_conformation)
+                        
+                        # Check if VDW energy is within threshold
+                        if vdw_energy < vdw_threshold and not math.isnan(vdw_energy):
+                            # Calculate score
+                            current_score, _ = self.score_conformation(optimized_conformation, include_vdw=True, include_distance=True, distance_weight=1000.0)
+                            
+                            # Update best score if this is better
+                            if current_score < best_score:
+                                best_score = current_score
+                                best_coords = optimized_conformation.coordinates.clone()
+                        
+                        # Restore original coordinates for next iteration
+                        optimized_conformation.coordinates = best_coords.clone()
+            
+            # Update to best conformation
+            optimized_conformation.coordinates = best_coords.clone()
+            
+            # Calculate final VDW energy
+            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, optimized_conformation)
+            
+            # Get centers for distance calculations
+            receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+            ligand_center = optimized_conformation.calculate_geometric_center().to(self.device)
+            ligand_group_center = self.calculate_center(optimized_conformation, self.ligand_group)
+            
+            # Calculate distances
+            ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
+            residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+            
+            # Check if VDW energy is within threshold and distance condition is met
+            if final_vdw < 1e5 and ligand_to_receptor_group > residue_group_distance:
+                optimized_conformations.append(optimized_conformation)
+        
+        self.logger.info(f"Found {len(optimized_conformations)} optimized conformations")
+        return optimized_conformations
+    
+    def search_conformations(self, num_rotations: int = 36) -> List[Structure]:
+        """
+        Search for docking conformations using translation-first approach.
         
         Args:
             num_rotations (int): Number of rotations (default: 36, 10 degrees each)
@@ -632,32 +1178,212 @@ class Docking:
         if not isinstance(num_rotations, int) or num_rotations <= 0:
             raise ValueError("num_rotations must be a positive integer")
         
+        # Before scanning, ensure ligand is not overlapping with receptor
+        current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+        
+        if current_vdw > 100000:  # Severe overlap, move ligand away
+            self.logger.info(f"Current VDW energy ({current_vdw:.2f}) is too high, moving ligand away from receptor first")
+            
+            # Calculate direction from receptor to ligand
+            receptor_center = self.receptor.calculate_geometric_center().to(self.device)
+            ligand_center = self.ligand.calculate_geometric_center().to(self.device)
+            direction = ligand_center - receptor_center
+            direction_normalized = direction / torch.norm(direction)
+            
+            # Move ligand away by 20Å
+            coord_manager = CoordinateManager(self.ligand, device=self.device)
+            translation = direction_normalized * 20.0
+            coord_manager.translate_coordinates(translation)
+        
+        # Step 1: Move ligand closer to receptor residue group carefully
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+        current_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+        
+        # If ligand is too far from receptor, move it closer gradually
+        if current_distance > 20.0:
+            self.logger.info(f"Ligand is too far from receptor ({current_distance:.2f} Å), moving it closer gradually")
+            
+            # Calculate direction vector
+            direction = receptor_group_center - ligand_group_center
+            direction_normalized = direction / torch.norm(direction)
+            
+            # Move ligand in small steps to avoid sudden collisions
+            target_distance = 15.0
+            total_translation = direction_normalized * (current_distance - target_distance)
+            
+            # Apply translation in small steps with VDW checks
+            step_size = 2.0
+            num_steps = int(torch.norm(total_translation).item() / step_size) + 1
+            incremental_translation = total_translation / num_steps
+            
+            coord_manager = CoordinateManager(self.ligand, device=self.device)
+            
+            for step in range(num_steps):
+                # Apply small translation
+                coord_manager.translate_coordinates(incremental_translation)
+                
+                # Check VDW energy
+                current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                
+                # If VDW energy becomes too high, stop moving
+                if current_vdw > 200000.0:
+                    self.logger.info(f"Stopped moving: VDW energy became too high ({current_vdw:.2f} kcal/mol)")
+                    break
+            
+            # Recalculate distance
+            new_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            new_distance = torch.norm(receptor_group_center - new_ligand_group_center).item()
+            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            self.logger.info(f"Moved ligand to {new_distance:.2f} Å from receptor residue group, VDW energy: {final_vdw:.2f} kcal/mol")
+        
+        # Step 2: Coarse translation scan (1Å step size)
+        # Use appropriate distance range based on current position
+        coarse_conformations = self._translation_scan(step_size=1.0, distance_range=(5.0, 25.0), vdw_threshold=200000.0)
+        
+        # If no conformations found, try with even larger VDW threshold and distance range
+        if not coarse_conformations:
+            self.logger.info("No conformations found, trying with larger VDW threshold and distance range")
+            coarse_conformations = self._translation_scan(step_size=2.0, distance_range=(3.0, 30.0), vdw_threshold=300000.0)
+        
+        # If still no conformations found, try random sampling with larger distance range and very loose VDW threshold
+        if not coarse_conformations:
+            self.logger.info("No conformations found, trying random sampling with larger distance range and loose VDW threshold")
+            coarse_conformations = self._random_sampling(num_samples=200, vdw_threshold=500000.0)
+        
+        if not coarse_conformations:
+            self.logger.warning("No valid conformations found after all attempts")
+            return [self._create_ligand_copy(self.ligand)]
+        
+        # Step 3: Rotation scan on coarse conformations with relaxed VDW threshold
+        rotated_conformations = self._rotation_scan(coarse_conformations, num_rotations=num_rotations, vdw_threshold=50000.0)
+        
+        # If no rotated conformations found, use coarse conformations directly
+        if not rotated_conformations:
+            self.logger.info("No rotated conformations found, using coarse conformations directly")
+            rotated_conformations = coarse_conformations
+        
+        # Step 4: Fine-grained optimization (0.1Å step size) with relaxed VDW threshold
+        fine_conformations = self._fine_grained_optimization(rotated_conformations, step_size=0.1, vdw_threshold=50000.0)
+        
+        # If no fine conformations found, use rotated conformations
+        if not fine_conformations:
+            self.logger.info("No optimized conformations found, using rotated conformations")
+            fine_conformations = rotated_conformations
+        
+        # Ensure we have at least one conformation
+        if not fine_conformations:
+            fine_conformations = rotated_conformations
+        
+        # Filter conformations to ensure residue group distance < ligand center to receptor residue group distance
+        filtered_conformations = []
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        
+        for conformation in fine_conformations:
+            # Calculate distances for this conformation
+            ligand_group_center = self.calculate_center(conformation, self.ligand_group)
+            ligand_center = conformation.calculate_geometric_center().to(self.device)
+            
+            group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+            ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
+            
+            if group_distance < ligand_to_receptor_group:
+                filtered_conformations.append(conformation)
+        
+        self.logger.info(f"Generated {len(fine_conformations)} valid conformations, {len(filtered_conformations)} of which satisfy residue group distance < ligand center to receptor residue group distance")
+        
+        # If no filtered conformations, return original fine_conformations as fallback
+        if not filtered_conformations:
+            self.logger.warning("No conformations satisfied residue group distance < ligand center to receptor residue group distance, returning all conformations")
+            return fine_conformations
+        
+        return filtered_conformations
+    
+    def _random_sampling(self, num_samples: int = 100, vdw_threshold: float = 50000.0) -> List[Structure]:
+        """
+        Perform random sampling of ligand positions around receptor residue group.
+        
+        Args:
+            num_samples (int): Number of random samples to generate
+            vdw_threshold (float): VDW energy threshold for collision detection
+            
+        Returns:
+            List[Structure]: List of valid conformations from random sampling
+        """
+        self.logger.info(f"=== Random Sampling (Samples: {num_samples}) ===")
+        
         conformations = []
-        rotation_step = 360.0 / num_rotations
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
         
-        # Use z-axis as rotation axis
-        rotation_axis = torch.tensor([0.0, 0.0, -1.0], device=self.device)
+        # Calculate ligand residue group position relative to ligand geometric center
+        ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+        ligand_group_offset = self.calculate_center(self.ligand, self.ligand_group) - ligand_geometric_center
         
-        # Rotation center is ligand geometric center
-        rotation_center = self.ligand_center
+        # Save original ligand position
+        original_position = self.ligand.coordinates.clone()
         
-        # Create copies of ligand for each rotation
-        for i in range(num_rotations):
-            # Create copy of base ligand with detached coordinates
-            ligand_copy = self._create_ligand_copy(self.ligand)
+        # Create coordinate manager
+        coord_manager = CoordinateManager(self.ligand, device=self.device)
+        
+        # Generate random positions
+        for i in range(num_samples):
+            # Generate random position around receptor residue group (3-12Å)
+            import random
+            distance = random.uniform(3.0, 12.0)
+            theta = random.uniform(0, 2 * math.pi)
+            phi = random.uniform(0, math.pi)
             
-            # Rotate ligand around z-axis
-            angle = i * rotation_step
-            CoordinateManager(ligand_copy, device=self.device).rotate_around_axis(rotation_axis, angle, rotation_center)
+            # Convert spherical coordinates to cartesian
+            dx = distance * math.sin(phi) * math.cos(theta)
+            dy = distance * math.sin(phi) * math.sin(theta)
+            dz = distance * math.cos(phi)
             
-            conformations.append(ligand_copy)
+            # Calculate target ligand residue group position
+            target_ligand_group_position = receptor_group_center + torch.tensor([dx, dy, dz], device=self.device)
+            
+            # Calculate required ligand geometric center position
+            target_ligand_center = target_ligand_group_position - ligand_group_offset
+            
+            # Calculate translation vector
+            translation = target_ligand_center - ligand_geometric_center
+            
+            # Apply translation
+            self.ligand.coordinates = original_position.clone()
+            coord_manager.translate_coordinates(translation)
+            
+            # Calculate VDW energy
+            vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            
+            # Check if VDW energy is within threshold
+            if vdw_energy < vdw_threshold and not math.isnan(vdw_energy):
+                # Validate ligand orientation
+                if not self._validate_ligand_orientation():
+                    # Try to correct orientation
+                    ligand_geometric_center = self.ligand.calculate_geometric_center().to(self.device)
+                    CoordinateManager(self.ligand, device=self.device).rotate_around_axis(
+                        torch.tensor([0.0, 1.0, 0.0], device=self.device),
+                        180.0,
+                        ligand_geometric_center
+                    )
+                    
+                    if not self._validate_ligand_orientation():
+                        continue
+                
+                # Create copy of valid conformation
+                valid_conformation = self._create_ligand_copy(self.ligand)
+                conformations.append(valid_conformation)
+        
+        self.logger.info(f"Found {len(conformations)} valid conformations from random sampling")
+        
+        # Restore original ligand position
+        self.ligand.coordinates = original_position.clone()
         
         return conformations
     
     # ---------------------------
     # Scoring Module
     # ---------------------------
-    def score_conformation(self, ligand_conformation: Structure, include_vdw: bool = True, include_distance: bool = False, distance_weight: float = 1.0, charge_weight: float = 1.0) -> Tuple[float, Dict[str, float]]:
+    def score_conformation(self, ligand_conformation: Structure, include_vdw: bool = True, include_distance: bool = True, distance_weight: float = 1.0, charge_weight: float = 1.0) -> Tuple[float, Dict[str, float]]:
         """
         Score a docking conformation using the energy calculator.
         
@@ -700,6 +1426,105 @@ class Docking:
             distance_weight=distance_weight,
             charge_weight=charge_weight
         )
+    
+    def _local_optimize_conformation(self, ligand_conformation: Structure) -> Structure:
+        """
+        Apply local optimization to a ligand conformation using gradient descent.
+        
+        Args:
+            ligand_conformation (Structure): Initial ligand conformation
+            
+        Returns:
+            Structure: Optimized ligand conformation
+        """
+        # Create a copy of the ligand conformation to optimize
+        optimized_ligand = self._create_ligand_copy(ligand_conformation)
+        
+        # Local optimization parameters
+        max_iterations = 20
+        learning_rate = 0.1
+        vdw_threshold = 1000.0
+        improvement_threshold = 0.1
+        
+        # Create coordinate manager for optimization
+        coord_manager = CoordinateManager(optimized_ligand, device=self.device)
+        
+        # Get receptor and ligand group centers
+        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+        
+        # Initial energy
+        current_score, _ = self.score_conformation(optimized_ligand, include_vdw=True, include_distance=True)
+        
+        for iteration in range(max_iterations):
+            # Calculate current ligand group center
+            current_ligand_group_center = self.calculate_center(optimized_ligand, self.ligand_group)
+            
+            # Calculate direction vector from ligand to receptor group center
+            direction = receptor_group_center - current_ligand_group_center
+            direction_norm = torch.norm(direction)
+            
+            if direction_norm < 0.1:  # Already very close, no need to optimize further
+                break
+            
+            # Normalize direction vector
+            direction_normalized = direction / direction_norm
+            
+            # Check if ligand protein vector is facing receptor residue group
+            ligand_geometric_center = optimized_ligand.calculate_geometric_center().to(self.device)
+            
+            # Calculate ligand protein vector (from ligand center to ligand residue group)
+            ligand_protein_vector = current_ligand_group_center - ligand_geometric_center
+            
+            # Calculate vector from ligand to receptor residue group (direction ligand should face)
+            lig_to_rec_vector = receptor_group_center - current_ligand_group_center
+            
+            # Normalize vectors for dot product calculation
+            if torch.norm(ligand_protein_vector) > 1e-6 and torch.norm(lig_to_rec_vector) > 1e-6:
+                normalized_lig_protein_vector = ligand_protein_vector / torch.norm(ligand_protein_vector)
+                normalized_lig_to_rec_vector = lig_to_rec_vector / torch.norm(lig_to_rec_vector)
+                
+                # Calculate dot product to check orientation
+                dot_product = torch.dot(normalized_lig_protein_vector, normalized_lig_to_rec_vector)
+                
+                # If the dot product is positive, the ligand protein vector is facing away from receptor
+                if dot_product > 0:
+                    # Rotate 180 degrees around y-axis to make ligand protein vector face receptor
+                    flip_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                    coord_manager.rotate_around_axis(flip_axis, 180.0, ligand_geometric_center)
+                    
+                    # Recalculate after rotation
+                    current_ligand_group_center = self.calculate_center(optimized_ligand, self.ligand_group)
+                    direction = receptor_group_center - current_ligand_group_center
+                    direction_norm = torch.norm(direction)
+                    if direction_norm < 0.1:
+                        break
+                    direction_normalized = direction / direction_norm
+            
+            # Calculate step vector (gradient descent)
+            step = direction_normalized * learning_rate
+            
+            # Apply translation
+            coord_manager.translate_coordinates(step)
+            
+            # Calculate new score
+            new_score, _ = self.score_conformation(optimized_ligand, include_vdw=True, include_distance=True)
+            
+            # Check if vdw energy is too high
+            vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, optimized_ligand)
+            if vdw_energy > vdw_threshold:
+                # If energy is too high, revert the step
+                coord_manager.translate_coordinates(-step)
+                break
+            
+            # Check if improvement is significant
+            if new_score >= current_score - improvement_threshold:
+                # No significant improvement, stop optimization
+                break
+            
+            # Update current score
+            current_score = new_score
+        
+        return optimized_ligand
     
     # ---------------------------
     # Main Docking Module
@@ -772,17 +1597,24 @@ class Docking:
         scored_conformations = []
         
         for i, conf in enumerate(conformations):
+            # Prioritize residue group proximity over energy by including distance with high weight
             score, detailed_scores = self.score_conformation(
                 conf, 
                 include_vdw=True, 
-                include_distance=False, 
+                include_distance=True, 
+                distance_weight=1000.0,  # High weight to prioritize proximity
                 charge_weight=1.0
             )
             scored_conformations.append((conf, score))
             
+            # Calculate residue group distance for logging
+            rec_group_center = self.calculate_center(self.receptor, self.receptor_group)
+            lig_group_center = self.calculate_center(conf, self.ligand_group)
+            group_distance = torch.norm(rec_group_center - lig_group_center).item()
+            
             if i % 10 == 0 or i == len(conformations) - 1:
-                self.logger.info(f"  Conformation {i+1}/{len(conformations)}: Score = {score:.2f}")
-                self.logger.debug(f"    Detailed scores: Electrostatic={detailed_scores['electrostatic']:.2f}, VDW={detailed_scores['vdw']:.2f}")
+                self.logger.info(f"  Conformation {i+1}/{len(conformations)}: Score = {score:.2f}, Group Distance = {group_distance:.4f} Å")
+                self.logger.debug(f"    Detailed scores: Electrostatic={detailed_scores['electrostatic']:.2f}, VDW={detailed_scores['vdw']:.2f}, Distance={detailed_scores['distance']:.2f}")
         
         # Step 4: Find best conformation
         scored_conformations.sort(key=lambda x: x[1])
@@ -820,17 +1652,13 @@ class Docking:
         # Add TER record after receptor atoms
         merged.add_other_record("TER")
         
-        # Add ligand atoms, updating atom serial numbers
-        next_serial = len(merged.atoms) + 1
+        # Add ligand atoms
         for i, atom in enumerate(ligand.atoms):
             coord = ligand.coordinates[i]
-            # Create a copy of the atom with updated serial number
-            new_atom = deepcopy(atom)
-            new_atom.atom_serial = next_serial
-            next_serial += 1
-            merged.add_atom(new_atom, (float(coord[0]), float(coord[1]), float(coord[2])))
+            merged.add_atom(atom, (float(coord[0]), float(coord[1]), float(coord[2])))
         
-        # Add final END record
+        # Add final TER and END records
+        merged.add_other_record("TER")
         merged.add_other_record("END")
         
         return merged
