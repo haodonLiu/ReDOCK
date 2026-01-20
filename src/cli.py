@@ -7,7 +7,9 @@ Provides command-line interface functionality for the PDB processor.
 """
 
 import sys
-from typing import List
+import argparse
+import json
+import os
 from src.io.parser import PDBParser
 from src.io.writer import PDBWriter
 from src.utils.logger import Logger
@@ -29,30 +31,25 @@ class PDBCLI:
         self.parser = None
         self.writer = None
     
-    def parse_arguments(self, args: List[str]) -> dict:
+    def parse_arguments(self, args: list) -> dict:
         """
-        Parse command-line arguments.
+        Parse command-line arguments using argparse.
         
         Args:
-            args (List[str]): Command-line arguments
+            args (list): Command-line arguments
             
         Returns:
             dict: Parsed arguments as a dictionary
         """
-        import json
-        import os
-        
-        parsed = {
+        # Default values
+        default_values = {
             'debug': False,
-            'mode': 'parse',  # 'parse', 'dock' or 'prealign'
+            'mode': 'parse',
             'input_file': None,
             'output_file': None,
-            # Translation parameters
-            'translate': False,
             'dx': 0.0,
             'dy': 0.0,
             'dz': 0.0,
-            # Docking parameters
             'receptor_file': None,
             'ligand_file': None,
             'receptor_chains': [],
@@ -66,391 +63,182 @@ class PDBCLI:
             'step_size': 1.0,
             'solvent_penalty_coeff': 0.1,
             'distance_penalty_coeff': 0.5,
-            'optimal_distance': 10.0,
             'save_all': False,
             'num_output_confs': 10
         }
         
-        # Check for JSON argument
+        # Check for JSON argument first
         json_arg = None
-        if '--json' in args:
-            idx = args.index('--json')
-            if idx + 1 < len(args):
-                json_arg = args[idx + 1]
-                args.pop(idx + 1)
-                args.pop(idx)
-        elif '-j' in args:
-            idx = args.index('-j')
-            if idx + 1 < len(args):
-                json_arg = args[idx + 1]
-                args.pop(idx + 1)
-                args.pop(idx)
+        if '--json' in args or '-j' in args:
+            json_idx = args.index('--json') if '--json' in args else args.index('-j')
+            if json_idx + 1 < len(args):
+                json_arg = args[json_idx + 1]
+                # Remove JSON arguments from args list
+                args = args[:json_idx] + args[json_idx + 2:]
         
-        # Parse JSON argument if provided
+        # Parse JSON if provided
         if json_arg:
-            # Check if it's a file path or JSON string
             if os.path.isfile(json_arg):
-                # Read from file
                 with open(json_arg, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
             else:
-                # Parse as JSON string
                 try:
                     json_data = json.loads(json_arg)
                 except json.JSONDecodeError:
+                    self.logger = Logger(False, None)
                     self.logger.error(f"Error: Invalid JSON string or file path: {json_arg}")
-                    return parsed
+                    return default_values
             
-            # Update parsed arguments with JSON data
+            # Update default values with JSON data
             for key, value in json_data.items():
-                if key in parsed:
-                    parsed[key] = value
+                if key in default_values:
+                    default_values[key] = value
             
-            # Set mode from JSON if not explicitly set in command line
             if 'mode' in json_data:
-                parsed['mode'] = json_data['mode']
+                default_values['mode'] = json_data['mode']
         
-        # Check for debug flag
-        if '--debug' in args:
-            parsed['debug'] = True
-            args.remove('--debug')
-        elif '-d' in args:
-            parsed['debug'] = True
-            args.remove('-d')
+        # Create argparse parser
+        parser = argparse.ArgumentParser(
+            description='PDB Processor - Protein Structure Analysis and Docking Tool',
+            formatter_class=argparse.RawTextHelpFormatter
+        )
         
-        # Check for GPU flag
-        if '--gpu' in args:
-            parsed['use_gpu'] = True
-            args.remove('--gpu')
+        # General options
+        parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode')
+        parser.add_argument('--gpu', action='store_true', help='Enable GPU acceleration (if available)')
         
-
+        # Mode-specific options
+        subparsers = parser.add_subparsers(dest='mode', help='Operation mode')
         
-        # Check for translate mode (overrides JSON if specified)
-        if '--translate' in args:
-            parsed['mode'] = 'translate'
-            args.remove('--translate')
-            
-            # Parse translation values
-            if '--dx' in args:
-                idx = args.index('--dx')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['dx'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            if '--dy' in args:
-                idx = args.index('--dy')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['dy'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            if '--dz' in args:
-                idx = args.index('--dz')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['dz'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-        # Check for dock mode or prealign mode (overrides JSON if specified)
-        elif '--dock' in args:
-            parsed['mode'] = 'dock'
-            args.remove('--dock')
-        elif '--prealign' in args:
-            parsed['mode'] = 'prealign'
-            args.remove('--prealign')
+        # Parse mode (default)
+        parse_parser = subparsers.add_parser('parse', help='Basic PDB file processing mode')
+        parse_parser.add_argument('input_file', nargs='?', help='Input PDB file path')
+        parse_parser.add_argument('output_file', nargs='?', help='Output PDB file path')
         
-        # Check for receptor file (in dock or prealign mode)
-        if parsed['mode'] in ['dock', 'prealign']:
-            if '--receptor' in args:
-                idx = args.index('--receptor')
-                if idx + 1 < len(args):
-                    parsed['receptor_file'] = args[idx + 1]
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for receptor chains (in dock or prealign mode)
-            if '--receptor-chains' in args:
-                idx = args.index('--receptor-chains')
-                if idx + 1 < len(args):
-                    parsed['receptor_chains'] = args[idx + 1].split(',')
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for ligand file (in dock or prealign mode)
-            if '--ligand' in args:
-                idx = args.index('--ligand')
-                if idx + 1 < len(args):
-                    parsed['ligand_file'] = args[idx + 1]
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for ligand chains (in dock or prealign mode)
-            if '--ligand-chains' in args:
-                idx = args.index('--ligand-chains')
-                if idx + 1 < len(args):
-                    parsed['ligand_chains'] = args[idx + 1].split(',')
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for receptor residues (in dock or prealign mode)
-            if '--receptor-residues' in args:
-                idx = args.index('--receptor-residues')
-                if idx + 1 < len(args):
-                    parsed['receptor_residues'] = args[idx + 1].split(',')
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for ligand residues (in dock or prealign mode)
-            if '--ligand-residues' in args:
-                idx = args.index('--ligand-residues')
-                if idx + 1 < len(args):
-                    parsed['ligand_residues'] = args[idx + 1].split(',')
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for max_dist (in dock or prealign mode)
-            if '--max-dist' in args:
-                idx = args.index('--max-dist')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['max_dist'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for force field file (in dock or prealign mode)
-            if '--force-field' in args:
-                idx = args.index('--force-field')
-                if idx + 1 < len(args):
-                    parsed['force_field'] = args[idx + 1]
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for num rotations (in dock mode only)
-            if parsed['mode'] == 'dock' and '--num-rotations' in args:
-                idx = args.index('--num-rotations')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['num_rotations'] = int(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for step size (in dock mode only)
-            if parsed['mode'] == 'dock' and '--step-size' in args:
-                idx = args.index('--step-size')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['step_size'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for solvent penalty coefficient (in dock mode only)
-            if parsed['mode'] == 'dock' and '--solvent-penalty' in args:
-                idx = args.index('--solvent-penalty')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['solvent_penalty_coeff'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for distance penalty coefficient (in dock mode only)
-            if parsed['mode'] == 'dock' and '--distance-penalty' in args:
-                idx = args.index('--distance-penalty')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['distance_penalty_coeff'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for optimal distance (in dock mode only)
-            if parsed['mode'] == 'dock' and '--optimal-distance' in args:
-                idx = args.index('--optimal-distance')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['optimal_distance'] = float(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for number of output conformations (in dock mode only)
-            if parsed['mode'] == 'dock' and '--num-output-confs' in args:
-                idx = args.index('--num-output-confs')
-                if idx + 1 < len(args):
-                    try:
-                        parsed['num_output_confs'] = int(args[idx + 1])
-                    except ValueError:
-                        pass
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for output file (in dock or prealign mode)
-            if '-o' in args:
-                idx = args.index('-o')
-                if idx + 1 < len(args):
-                    parsed['output_file'] = args[idx + 1]
-                    args.pop(idx + 1)
-                    args.pop(idx)
-            
-            # Check for save all conformations option (in dock mode only)
-            if parsed['mode'] == 'dock' and '--save-all' in args:
-                parsed['save_all'] = True
-                args.remove('--save-all')
-        else:
-            # Parse mode: input and output files
-            # Check for input file
-            if len(args) >= 1:
-                parsed['input_file'] = args[0]
-            
-            # Check for output file
-            if len(args) >= 2:
-                parsed['output_file'] = args[1]
+        # Translate mode
+        translate_parser = subparsers.add_parser('translate', help='Protein coordinate translation mode')
+        translate_parser.add_argument('input_file', help='Input PDB file path')
+        translate_parser.add_argument('output_file', nargs='?', help='Output PDB file path')
+        translate_parser.add_argument('--dx', type=float, default=0.0, help='X-axis translation distance (Å)')
+        translate_parser.add_argument('--dy', type=float, default=0.0, help='Y-axis translation distance (Å)')
+        translate_parser.add_argument('--dz', type=float, default=0.0, help='Z-axis translation distance (Å)')
         
-        return parsed
+        # Prealign mode
+        prealign_parser = subparsers.add_parser('prealign', help='Protein pre-alignment mode')
+        prealign_parser.add_argument('--receptor', required=True, help='Receptor protein PDB file path')
+        prealign_parser.add_argument('--ligand', required=True, help='Ligand protein PDB file path')
+        prealign_parser.add_argument('--receptor-chains', type=str, help='Receptor chain IDs (comma-separated)')
+        prealign_parser.add_argument('--ligand-chains', type=str, help='Ligand chain IDs (comma-separated)')
+        prealign_parser.add_argument('--receptor-residues', required=True, type=str, help='Receptor residue group (comma-separated)')
+        prealign_parser.add_argument('--ligand-residues', required=True, type=str, help='Ligand residue group (comma-separated)')
+        prealign_parser.add_argument('--max-dist', type=float, default=5.0, help='Maximum search distance (Å)')
+        prealign_parser.add_argument('--force-field', help='Force field XML file path')
+        prealign_parser.add_argument('-o', '--output-file', help='Output file path')
+        
+        # Dock mode
+        dock_parser = subparsers.add_parser('dock', help='Protein docking conformation search mode')
+        dock_parser.add_argument('--receptor', required=True, help='Receptor protein PDB file path')
+        dock_parser.add_argument('--ligand', required=True, help='Ligand protein PDB file path')
+        dock_parser.add_argument('--receptor-chains', type=str, help='Receptor chain IDs (comma-separated)')
+        dock_parser.add_argument('--ligand-chains', type=str, help='Ligand chain IDs (comma-separated)')
+        dock_parser.add_argument('--receptor-residues', required=True, type=str, help='Receptor residue group (comma-separated)')
+        dock_parser.add_argument('--ligand-residues', required=True, type=str, help='Ligand residue group (comma-separated)')
+        dock_parser.add_argument('--max-dist', type=float, default=5.0, help='Maximum search distance (Å)')
+        dock_parser.add_argument('--num-rotations', type=int, default=36, help='Number of rotations')
+        dock_parser.add_argument('--step-size', type=float, default=1.0, help='Step size for intermediate conformation generation (Å)')
+        dock_parser.add_argument('--solvent-penalty', type=float, default=0.1, help='Solvent penalty coefficient')
+        dock_parser.add_argument('--distance-penalty', type=float, default=0.5, help='Distance penalty coefficient')
+        dock_parser.add_argument('--num-output-confs', type=int, default=10, help='Number of output conformations')
+        dock_parser.add_argument('--force-field', help='Force field XML file path')
+        dock_parser.add_argument('-o', '--output-file', help='Output file path')
+        dock_parser.add_argument('--save-all', action='store_true', help='Save all generated conformations')
+        dock_parser.add_argument('--gpu', action='store_true', help='Enable GPU acceleration (if available)')
+        
+        # Add --gpu to prealign parser as well
+        prealign_parser.add_argument('--gpu', action='store_true', help='Enable GPU acceleration (if available)')
+        
+        # Parse arguments
+        parsed_args = parser.parse_args(args)
+        
+        # Convert parsed args to dictionary
+        args_dict = vars(parsed_args)
+        
+        # Update default values with parsed args
+        for key, value in args_dict.items():
+            if value is not None:
+                default_values[key] = value
+        
+        # Map argparse parameters to expected keys
+        if 'receptor' in args_dict and args_dict['receptor'] is not None:
+            default_values['receptor_file'] = args_dict['receptor']
+        if 'ligand' in args_dict and args_dict['ligand'] is not None:
+            default_values['ligand_file'] = args_dict['ligand']
+        
+        # Handle comma-separated values only if they are strings
+        if default_values.get('receptor_chains') and isinstance(default_values['receptor_chains'], str):
+            default_values['receptor_chains'] = default_values['receptor_chains'].split(',')
+        if default_values.get('ligand_chains') and isinstance(default_values['ligand_chains'], str):
+            default_values['ligand_chains'] = default_values['ligand_chains'].split(',')
+        if default_values.get('receptor_residues') and isinstance(default_values['receptor_residues'], str):
+            default_values['receptor_residues'] = default_values['receptor_residues'].split(',')
+        if default_values.get('ligand_residues') and isinstance(default_values['ligand_residues'], str):
+            default_values['ligand_residues'] = default_values['ligand_residues'].split(',')
+        
+        # Special handling for mode (if not set via JSON or command line)
+        if default_values['mode'] is None:
+            default_values['mode'] = 'parse'
+        
+        return default_values
     
     def print_help(self) -> None:
         """
         Print help message.
         """
         print("=== PDB Processor Usage Instructions ===")
-        print("\n0. Basic Usage:")
-        print("   Usage: python main.py [--help/-h]")
-        print("   Function: Print this help message")
-        print("   Parameter description:")
-        print("     --help/-h                  Print this help message")
-        print("\n1. JSON Parameter Mode (for all modes):")
-        print("   Usage: python main.py [--json/-j <json_string_or_file>] [--debug/-d]")
-        print("   Function: Specify all parameters through JSON string or file to simplify command line input")
-        print("   Parameter description:")
-        print("     --json/-j <string/file>      JSON parameter string or file path")
-        print("     --debug/-d                  Enable debug mode")
-        print("   JSON parameter format example：")
-        print("   {")
-        print("     \"mode\": \"dock\",")
-        print("     \"receptor_file\": \"structure/PP5_CD.pdb\",")
-        print("     \"ligand_file\": \"structure/triP-KD_AKT1.pdb\",")
-        print("     \"receptor_residues\": [\"B:184\", \"B:185\"],")
-        print("     \"ligand_residues\": [\"A:144\", \"A:145\"],")
-        print("     \"max_dist\": 5.0,")
-        print("     \"num_rotations\": 10,")
-        print("     \"force_field\": \"data/force_field/ff14SB.xml\",")
-        print("     \"output_file\": \"docked.pdb\",")
-        print("     \"use_gpu\": true")
-        print("   }")
-        
-        print("\n1. Basic PDB File Processing Mode：")
-        print("   Usage：python main.py <pdb_file_path> [output_file_path] [--debug/-d]")
-        print("   Function：Parse PDB file and display statistics, optionally write parsed data to new file")
-        
-        print("\n2. Protein Coordinate Translation Mode：")
-        print("   Usage：python main.py --translate <pdb_file_path> [--dx <value>] [--dy <value>] [--dz <value>] [output_file_path] [--debug/-d]")
-        print("   Function：Directly translate protein coordinates, supporting translation in X, Y, Z directions")
-        print("   Parameter description：")
-        print("     --translate                 Enable translation mode")
-        print("     --dx <value>                X-axis translation distance (Å), default：0.0")
-        print("     --dy <value>                Y-axis translation distance (Å), default：0.0")
-        print("     --dz <value>                Z-axis translation distance (Å), default：0.0")
-        print("     --debug/-d                  Enable debug mode")
-        
-        print("\n3. Protein Pre-alignment Mode：")
-        print("   Usage：python main.py --prealign --receptor <receptor_file> --ligand <ligand_file> ")
-        print("             --receptor-residues <residues> --ligand-residues <residues> [--max-dist <distance>] ")
-        print("             [--force-field <file>] [-o <output_file>] [--gpu] [--debug/-d]")
-        print("   Function：Pre-align receptor and ligand proteins, perform spatial arrangement based on specified residue groups, no conformation search")
-        print("   Parameter description：")
-        print("     --receptor <file>           Receptor protein PDB file path")
-        print("     --ligand <file>             Ligand protein PDB file path")
-        print("     --receptor-chains <list>    Receptor chain IDs, format：A,B,C (for same-file docking)")
-        print("     --ligand-chains <list>      Ligand chain IDs, format：D,E,F (for same-file docking)")
-        print("     --receptor-residues <list>  Receptor residue group, format：chain:residue,chain:residue (e.g.：A:100,A:101)")
-        print("     --ligand-residues <list>    Ligand residue group, same format")
-        print("     --max-dist <distance>       Maximum search distance, default：5.0 Å")
-        print("     --force-field <file>        Force field XML file path for energy calculation")
-        print("     --step-size <value>         Step size for intermediate conformation generation, default：1.0 Å")
-        print("     --solvent-penalty <value>   Solvent penalty coefficient, default：0.1 kcal/mol per contact")
-        print("     --distance-penalty <value>  Distance penalty coefficient, default：0.5 kcal/mol per Å")
-        print("     --optimal-distance <value>  Optimal center distance, default：10.0 Å")
-        print("     -o <file>                   Output file path")
-        print("     --gpu                       Enable GPU acceleration (if available)")
-        print("     --debug/-d                  Enable debug mode")
-        
-        print("\n4. Protein Docking Conformation Search Mode：")
-        print("   Usage：python main.py --dock --receptor <receptor_file> --ligand <ligand_file> ")
-        print("             --receptor-residues <residues> --ligand-residues <residues> [--max-dist <distance>] ")
-        print("             [--num-rotations <number>] [--force-field <file>] [-o <output_file>] [--gpu] [--debug/-d]")
-        print("   Function：Search protein docking conformations, perform spatial arrangement and scoring based on specified residue groups")
-        print("   Parameter description：")
-        print("     --receptor <file>           Receptor protein PDB file path")
-        print("     --ligand <file>             Ligand protein PDB file path")
-        print("     --receptor-chains <list>    Receptor chain IDs, format：A,B,C (for same-file docking)")
-        print("     --ligand-chains <list>      Ligand chain IDs, format：D,E,F (for same-file docking)")
-        print("     --receptor-residues <list>  Receptor residue group, format：chain:residue,chain:residue (e.g.：A:100,A:101)")
-        print("     --ligand-residues <list>    Ligand residue group, same format")
-        print("     --max-dist <distance>       Maximum search distance, default：5.0 Å")
-        print("     --num-rotations <number>    Number of rotations, default：36 times (10 degrees each)")
-        print("     --force-field <file>        Force field XML file path for energy calculation")
-        print("     --step-size <value>         Step size for intermediate conformation generation, default：1.0 Å")
-        print("     --solvent-penalty <value>   Solvent penalty coefficient, default：0.1 kcal/mol per contact")
-        print("     --distance-penalty <value>  Distance penalty coefficient, default：0.5 kcal/mol per Å")
-        print("     --optimal-distance <value>  Optimal center distance, default：10.0 Å")
-        print("     --num-output-confs <number> Number of output conformations, default：10")
-        print("     -o <file>                   Output file path")
-        print("     --save-all                  Save all generated conformations, default：False")
-        print("     --gpu                       Enable GPU acceleration (if available)")
-        print("     --debug/-d                  Enable debug mode")
-        
-        print("\nExamples：")
-        print("   1. Basic mode：python main.py structure/PP5_CD.pdb output.pdb")
-        print("   2. Translation mode：python main.py --translate structure/PP5_CD.pdb --dx 5.0 --dz 10.0 translated.pdb")
-        print("   3. Pre-alignment mode：python main.py --prealign --receptor structure/PP5_CD.pdb --ligand structure/triP-KD_AKT1.pdb ")
-        print("                 --receptor-residues B:184,B:185 --ligand-residues A:144,A:145 --gap 5.0 -o prealigned.pdb")
-        print("   4. Docking mode：python main.py --dock --receptor structure/PP5_CD.pdb --ligand structure/triP-KD_AKT1.pdb ")
-        print("                 --receptor-residues B:184,B:185 --ligand-residues A:144,A:145 --gap 5.0 --num-rotations 10")
-        print("                 -o docked.pdb --gpu")
-        print("   5. Docking mode with save all conformations：python main.py --dock --receptor structure/PP5_CD.pdb --ligand structure/triP-KD_AKT1.pdb ")
-        print("                 --receptor-residues B:184,B:185 --ligand-residues A:144,A:145 --num-rotations 10")
-        print("                 -o docked.pdb --save-all")
-        print("   6. JSON mode：python main.py -j '{\"mode\":\"parse\",\"input_file\":\"structure/PP5_CD.pdb\"}'")
-        print("   7. JSON file mode：python main.py --json config.json")
+        print("\nBasic Usage:")
+        print("  python main.py [mode] [options]")
+        print("\nModes:")
+        print("  parse       Basic PDB file processing")
+        print("  translate   Protein coordinate translation")
+        print("  prealign    Protein pre-alignment for docking")
+        print("  dock        Protein docking conformation search")
+        print("\nCommon Options:")
+        print("  --help, -h  Show this help message")
+        print("  --debug, -d Enable debug mode")
+        print("  --gpu       Enable GPU acceleration")
+        print("  --json, -j  JSON parameter string or file path")
+        print("\nExamples:")
+        print("  # Basic parsing")
+        print("  python main.py parse structure/PP5_CD.pdb output.pdb")
+        print("  ")
+        print("  # Translation")
+        print("  python main.py translate structure/PP5_CD.pdb --dx 5.0 --dz 10.0 translated.pdb")
+        print("  ")
+        print("  # Docking")
+        print("  python main.py dock --receptor structure/PP5_CD.pdb --ligand structure/triP-KD_AKT1.pdb ")
+        print("                   --receptor-residues B:184,B:185 --ligand-residues A:144,A:145 ")
+        print("                   --max-dist 5.0 --num-rotations 10 --gpu")
+        print("  ")
+        print("  # JSON mode")
+        print("  python main.py --json '{\"mode\":\"dock\",\"receptor_file\":\"structure/PP5_CD.pdb\",\"ligand_file\":\"structure/triP-KD_AKT1.pdb\",\"receptor_residues\":[\"B:184\",\"B:185\"],\"ligand_residues\":[\"A:144\",\"A:145\"]}'")
     
-    def run(self, args: List[str]) -> int:
+    def run(self, args: list) -> int:
         """
         Run the CLI application.
         
         Args:
-            args (List[str]): Command-line arguments
+            args (list): Command-line arguments
             
         Returns:
             int: Exit code (0 for success, 1 for failure)
         """
-        # Check for help flag first, before parsing arguments
-        if '--help' in args or '-h' in args:
-            self.print_help()
-            return 0
+        # Initialize logger early for error handling during parsing
+        self.logger = Logger(False, None)  # Default to non-debug mode for parsing
         
         # Parse arguments
         parsed_args = self.parse_arguments(args)
         
-        # Initialize logger and components
-        # Create log file path if output folder is specified or we're in dock/prealign mode
+        # Re-initialize logger with correct debug setting
         log_file = None
         self.logger = Logger(parsed_args['debug'], log_file)
         self.parser = PDBParser(self.logger)
@@ -698,7 +486,7 @@ class PDBCLI:
         
         self.logger.section("Pre-alignment Completed")
         
-        self.logger.info(f"\nProject folder: {project_dir}")
+        self.logger.info(f"Project folder: {project_dir}")
         
         # Save parsed arguments to JSON file
         import json
@@ -789,12 +577,6 @@ class PDBCLI:
         
         # Set search and penalty parameters
         docking.step_size = parsed_args['step_size']
-        # Use the new method to set scoring parameters, ensuring they're passed to EnergyCalculator
-        docking.set_scoring_parameters(
-            parsed_args['solvent_penalty_coeff'],
-            parsed_args['distance_penalty_coeff'],
-            parsed_args['optimal_distance']
-        )
         
         # Load force field if specified
         if parsed_args['force_field']:
@@ -817,7 +599,7 @@ class PDBCLI:
         self.logger.section("Docking Parameters")
         self.logger.info(f"  Maximum search distance: {parsed_args['max_dist']} Å")
         self.logger.info(f"  Number of rotations: {parsed_args['num_rotations']}")
-        self.logger.info(f"\nProject folder: {project_dir}")
+        self.logger.info(f"Project folder: {project_dir}")
         
         # Save parsed arguments to JSON file
         import json
@@ -847,7 +629,7 @@ class PDBCLI:
             self.logger.error("Error: No conformations generated. Please check if the specified residue groups exist in the PDB files.")
             return 1
         
-        self.logger.info(f"\nTop 5 Best Conformation Scores:")
+        self.logger.info(f"Top 5 Best Conformation Scores:")
         for i, (conf, score) in enumerate(scored_conformations[:5]):
             self.logger.info(f"  Conformation {i+1}: Score = {score:.2f}")
         
@@ -859,11 +641,10 @@ class PDBCLI:
         # Calculate score breakdown percentages
         self.logger.section("Best Conformation Score Details")
         self.logger.info(f"Total score: {best_score:.2f} kcal/mol")
-        self.logger.info("\nScore breakdown:")
+        self.logger.info("Score breakdown:")
         
         # Calculate total absolute value for percentage calculation
-        total_abs = abs(detailed_scores['van_der_waals']) + abs(detailed_scores['electrostatic']) + \
-                    abs(detailed_scores['solvent_penalty']) + abs(detailed_scores['distance_penalty'])
+        total_abs = sum(abs(value) for value in detailed_scores.values())
         
         # Print each component with its percentage
         for component, value in detailed_scores.items():
@@ -906,27 +687,6 @@ class PDBCLI:
                         self.logger.info(f"Saved conformation {i+1}/{len(scored_conformations)}")
         else:
             self.logger.info("Skipping saving all conformations (use --save-all option to save all)")
-        
-        # Write results to CSV file
-        csv_file = os.path.join(project_dir, "docking_results.csv")
-        self.logger.info(f"\nWriting docking results to CSV file: {csv_file}")
-        
-        with open(csv_file, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Conformation ID", "Score", "File Path"])
-            
-            # Best conformation
-            writer.writerow([1, scored_conformations[0][1], "best_conformation.pdb"])
-            
-            # All other conformations
-            if parsed_args['save_all']:
-                for i, (conf, score) in enumerate(scored_conformations[1:], start=2):
-                    writer.writerow([i, score, f"conformations/conformation_{i}.pdb"])
-            else:
-                # Only write best conformation to CSV if save_all is False
-                self.logger.info("CSV file contains only the best conformation information")
-        
-        self.logger.info("CSV results file written successfully")
         
         return 0
 

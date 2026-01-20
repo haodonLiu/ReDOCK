@@ -7,7 +7,6 @@ Defines the Structure class for storing PDB structure information including atom
 coordinates, and other records.
 """
 
-import math
 import torch
 from typing import List, Tuple, Dict, Any, Optional
 from .atom import PDBAtom

@@ -32,8 +32,7 @@ class EnergyCalculator:
     """
     def __init__(self, force_field: ForceField, device: torch.device = torch.device("cpu"),
                  solvent_penalty_coeff: float = 0.1,
-                 distance_penalty_coeff: float = 0.5,
-                 optimal_distance: float = 10.0):
+                 distance_penalty_coeff: float = 0.5):
         """
         Initialize the energy calculator.
         
@@ -42,14 +41,12 @@ class EnergyCalculator:
             device (torch.device, optional): Device for calculations
             solvent_penalty_coeff (float, optional): Solvent penalty coefficient
             distance_penalty_coeff (float, optional): Distance penalty coefficient
-            optimal_distance (float, optional): Optimal center-center distance (Å)
         """
         self.device = device
         self.force_field = force_field
         # Scoring parameters
         self.solvent_penalty_coeff = solvent_penalty_coeff  # kcal/mol per contact
         self.distance_penalty_coeff = distance_penalty_coeff  # kcal/mol per Å
-        self.optimal_distance = optimal_distance  # Optimal center-center distance (Å)
     
     def _is_hydrogen(self, atom_name: str) -> bool:
         """
@@ -234,10 +231,10 @@ class EnergyCalculator:
         # Apply cutoff
         cutoff_mask = distances > cutoff
         
-        # Get charges
+        # Get charges for non-hydrogen atoms
         def get_charges(atoms, mask):
             charges = []
-            for atom, include in zip(atoms, mask):
+            for i, (atom, include) in enumerate(zip(atoms, mask)):
                 if include:
                     charge = self.force_field.get_atom_charge(atom.res_name, atom.atom_name)
                     charges.append(charge)
@@ -313,26 +310,29 @@ class EnergyCalculator:
                                   lig_group_center: torch.Tensor) -> float:
         """
         Calculate distance penalty based on residue group center distance.
+        Rewards closer distances (more negative = better) to promote better docking results.
         
         Args:
             rec_group_center (torch.Tensor): Receptor residue group center
             lig_group_center (torch.Tensor): Ligand residue group center
             
         Returns:
-            float: Distance penalty in kcal/mol
+            float: Distance penalty in kcal/mol (negative values are rewards)
         """
         group_distance = torch.norm(rec_group_center - lig_group_center).item()
         
-        if group_distance <= self.optimal_distance:
-            return 0.0
-        else:
-            distance_deviation = group_distance - self.optimal_distance
-            return float((distance_deviation + 1) * self.distance_penalty_coeff)
+        # Reward closer distances - the closer, the higher the reward (more negative)
+        # Use exponential function to create stronger rewards for very close distances
+        # but still maintain a smooth gradient
+        reward = -math.exp(-group_distance / 5.0) * self.distance_penalty_coeff * 10.0
+        
+        return float(reward)
     
     def calculate_attraction_potential(self, rec_group_center: torch.Tensor, 
                                       lig_group_center: torch.Tensor) -> Tuple[float, torch.Tensor]:
         """
         Calculate continuous attraction potential between residue groups and the corresponding force vector.
+        Now always attracts ligand towards receptor regardless of distance.
         
         Args:
             rec_group_center (torch.Tensor): Receptor residue group center
@@ -344,8 +344,7 @@ class EnergyCalculator:
                 - Force vector acting on ligand (towards receptor) in kcal/(mol·Å)
         """
         # Parameters
-        k_attraction = 10000.0  # Spring constant (kcal/mol·Å²)
-        alpha = 0.2  # Decay constant (1/Å)
+        k_attraction = 1000.0  # Spring constant (kcal/mol·Å²)
         
         # Calculate distance and direction
         delta = rec_group_center - lig_group_center
@@ -355,14 +354,13 @@ class EnergyCalculator:
             return 0.0, torch.zeros(3, device=self.device)
         
         direction = delta / distance
-        distance_deviation = distance - self.optimal_distance
         
-        # Calculate potential and force
-        exp_term = math.exp(-alpha * distance_deviation)
-        attraction_potential = k_attraction * distance_deviation**2 * exp_term
+        # Calculate potential and force - always attract ligand towards receptor
+        # Potential increases with distance
+        attraction_potential = k_attraction * distance**2
         
-        force_magnitude = - (2 * k_attraction * distance_deviation * exp_term - 
-                           k_attraction * distance_deviation**2 * alpha * exp_term)
+        # Force always points towards receptor
+        force_magnitude = -2 * k_attraction * distance
         
         force_vector = direction * force_magnitude
         
@@ -511,7 +509,8 @@ class EnergyCalculator:
     def score_conformation(self, receptor: Structure, ligand: Structure, 
                           rec_group_indices: List[int], lig_group_indices: List[int]) -> Tuple[float, Dict[str, float]]:
         """
-        Score a docking conformation based on various energy components.
+        Score a docking conformation based on electrostatic energy and distance.
+        Rewards closer distances to promote better docking results.
         
         Args:
             receptor (Structure): Receptor protein structure
@@ -522,7 +521,10 @@ class EnergyCalculator:
         Returns:
             Tuple[float, Dict[str, float]]: Total score and detailed scores
         """
-        # Get residue group coordinates and centers
+        # Calculate electrostatic energy
+        electrostatic_energy = self.calculate_electrostatic_energy(receptor, ligand)
+        
+        # Calculate residue group centers
         rec_coords = receptor.coordinates.to(self.device)
         lig_coords = ligand.coordinates.to(self.device)
         
@@ -532,28 +534,19 @@ class EnergyCalculator:
         rec_group_center = torch.mean(rec_group_coords, dim=0)
         lig_group_center = torch.mean(lig_group_coords, dim=0)
         
-        # Calculate energy components
-        vdw_energy = self.calculate_vdw_energy(receptor, ligand)
-        electrostatic_energy = self.calculate_electrostatic_energy(receptor, ligand)
-        solvent_penalty = self.calculate_solvent_penalty(receptor, ligand, rec_group_coords, lig_group_coords)
+        # Calculate distance penalty (now includes rewards for closer distances)
         distance_penalty = self.calculate_distance_penalty(rec_group_center, lig_group_center)
-        
-        # Calculate attraction potential
-        attraction_potential, _ = self.calculate_attraction_potential(rec_group_center, lig_group_center)
         
         # Verify electrostatic principles
         self._verify_electrostatic_principles(receptor, ligand, rec_group_indices, lig_group_indices)
         
-        # Calculate total score
-        total_score = vdw_energy + electrostatic_energy + solvent_penalty + distance_penalty + attraction_potential
+        # Calculate total score (electrostatic energy + distance penalty/reward)
+        total_score = electrostatic_energy + distance_penalty
         
         # Create detailed score dictionary
         detailed_scores = {
-            'van_der_waals': vdw_energy,
             'electrostatic': electrostatic_energy,
-            'solvent_penalty': solvent_penalty,
-            'distance_penalty': distance_penalty,
-            'attraction_potential': attraction_potential
+            'distance': distance_penalty
         }
         
         return total_score, detailed_scores

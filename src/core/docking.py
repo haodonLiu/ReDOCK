@@ -7,7 +7,6 @@ Handles protein-protein docking conformation search with PyTorch acceleration.
 """
 
 from typing import List, Tuple, Dict
-import math
 import torch
 from copy import deepcopy
 from src.models.structure import Structure
@@ -37,22 +36,15 @@ class Docking:
         self.ligand = None
         self.receptor_group = []
         self.ligand_group = []
-        self.max_dist = 0.0
         # Search parameters
-        self.step_size = 1.0  # Distance step size for intermediate conformations
+        self.step_size = 0.1  # Distance step size for intermediate conformations
         self.force_field = ForceField()
-        # Scoring parameters
-        self.solvent_penalty_coeff = 0.1  # kcal/mol per contact
-        self.distance_penalty_coeff = 0.5  # kcal/mol per Å
-        self.optimal_distance = 10.0  # Optimal center-center distance (Å)
         # Set device for PyTorch calculations
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_gpu else "cpu")
         # Initialize energy calculator
         self.energy_calculator = EnergyCalculator(
-            self.force_field, self.device,
-            solvent_penalty_coeff=self.solvent_penalty_coeff,
-            distance_penalty_coeff=self.distance_penalty_coeff,
-            optimal_distance=self.optimal_distance
+            self.force_field,
+            self.device
         )
         self.logger.log(f"Using device: {self.device}")
     
@@ -88,27 +80,6 @@ class Docking:
         """
         self.receptor = receptor
         self.ligand = ligand
-    
-    def set_scoring_parameters(self, solvent_penalty_coeff: float, distance_penalty_coeff: float, optimal_distance: float) -> None:
-        """
-        Set scoring parameters for energy calculation.
-        
-        Args:
-            solvent_penalty_coeff (float): Solvent penalty coefficient
-            distance_penalty_coeff (float): Distance penalty coefficient
-            optimal_distance (float): Optimal center-center distance (Å)
-        """
-        self.solvent_penalty_coeff = solvent_penalty_coeff
-        self.distance_penalty_coeff = distance_penalty_coeff
-        self.optimal_distance = optimal_distance
-        
-        # Update energy calculator with new parameters
-        self.energy_calculator = EnergyCalculator(
-            self.force_field, self.device,
-            solvent_penalty_coeff=solvent_penalty_coeff,
-            distance_penalty_coeff=distance_penalty_coeff,
-            optimal_distance=optimal_distance
-        )
     
     def identify_residue_group(self, structure: Structure, residue_ids: List[str]) -> List[int]:
         """
@@ -165,6 +136,7 @@ class Docking:
     def calculate_center(self, structure: Structure, atom_indices: List[int] = None) -> torch.Tensor:
         """
         Calculate center coordinates of specified atoms.
+        Uses Structure's built-in calculate_geometric_center method for all atoms.
         
         Args:
             structure (Structure): Protein structure
@@ -174,19 +146,13 @@ class Docking:
         Returns:
             torch.Tensor: Center coordinates as a tensor
         """
-        if structure.coordinates.shape[0] == 0:
-            raise ValueError(f"[calculate_center] Structure coordinates are empty for {structure.name}")
-        
-        coords = structure.coordinates.to(self.device)
-        
         if atom_indices is None:
-            # Calculate mean for all atoms
-            center = torch.mean(coords, dim=0)
+            # Use Structure's built-in method for all atoms
+            return structure.calculate_geometric_center().to(self.device)
         else:
             # Calculate mean for specified atoms
-            center = torch.mean(coords[atom_indices], dim=0)
-        
-        return center
+            coords = structure.coordinates.to(self.device)
+            return torch.mean(coords[atom_indices], dim=0)
     
     def calculate_vector(self, start: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
         """
@@ -200,9 +166,7 @@ class Docking:
             torch.Tensor: Vector from start to end
         """
         return end - start
-    
-
-    
+        
     def align_proteins(self) -> None:
         """
         Align receptor and ligand proteins according to specified constraints.
@@ -216,36 +180,35 @@ class Docking:
         if not self.receptor or not self.ligand:
             raise ValueError("[align_proteins] Receptor or ligand structure is None")
         
-        self.logger.info("\n"+"="*20+" Protein Alignment "+"="*20+"\n")
+        self.logger.info("===== Protein Alignment =====")
         
         # Import alignment functions
         from src.core.alignment import align_proteins as alignment_align_proteins
-        from src.core.alignment import validate_alignment
         
         # Use the new alignment algorithm
         alignment_align_proteins(self.receptor, self.receptor_group, self.ligand, self.ligand_group)
         
-        # Validate alignment
-        validation_result = validate_alignment(self.receptor, self.receptor_group, self.ligand, self.ligand_group)
-        self.logger.info("\n" + "="*20 + " alignment validation " + "="*20)
-        for key, value in validation_result.items():
-            self.logger.info(f"{key}: {'✓' if value else '✗'}")
-        
         # --------------------------
         # Position Ligand Along Z-axis
         # --------------------------
-        from src.core.alignment import calculate_group_center, calculate_protein_center
+        
+        # Calculate current centers after alignment using Structure's built-in method
+        rec_center = self.receptor.calculate_geometric_center().to(self.device)
+        lig_center = self.ligand.calculate_geometric_center().to(self.device)
+        
+        # Calculate group centers
+        def calculate_group_center(structure, atom_indices):
+            coords = structure.coordinates.to(self.device)
+            return torch.mean(coords[atom_indices], dim=0)
         
         final_rec_group_center = calculate_group_center(self.receptor, self.receptor_group)
         pre_lig_group_center = calculate_group_center(self.ligand, self.ligand_group)
-        rec_center = calculate_protein_center(self.receptor)
+        
+        # Update ligand center after translation
         lig_center = calculate_protein_center(self.ligand)
-        lig_dist = torch.norm(pre_lig_group_center - lig_center)
-        rec_dist = torch.norm(final_rec_group_center - rec_center)
-        final_dist = lig_dist + rec_dist + self.max_dist
-        # Use detach() to remove gradient information before creating new tensor
-        lig_trans = torch.tensor([0.0, 0.0, final_dist.detach()], dtype=torch.float16, device=self.device)
-        CoordinateManager(self.ligand, device=self.device).translate_coordinates(lig_trans)
+        
+        # Calculate final ligand group center after translation
+        final_lig_group_center = calculate_group_center(self.ligand, self.ligand_group)
         
         # --------------------------
         # Final verification
@@ -253,22 +216,41 @@ class Docking:
         final_lig_group_center = calculate_group_center(self.ligand, self.ligand_group)
         actual_distance = torch.norm(final_rec_group_center - final_lig_group_center).item()
         
-        self.logger.info(f"\n" + "="*20 + " final alignment results " + "="*20)
-        self.logger.info(f"receptor center: ({final_rec_group_center[0]:.4f}, {final_rec_group_center[1]:.4f}, {final_rec_group_center[2]:.4f})")
-        self.logger.info(f"ligand center: ({final_lig_group_center[0]:.4f}, {final_lig_group_center[1]:.4f}, {final_lig_group_center[2]:.4f})")
+        self.logger.info(f"=== final alignment results ===")
+        self.logger.info(f"receptor center: ({rec_center[0]:.4f}, {rec_center[1]:.4f}, {rec_center[2]:.4f})")
+        self.logger.info(f"ligand center: ({lig_center[0]:.4f}, {lig_center[1]:.4f}, {lig_center[2]:.4f})")
         self.logger.info(f"distance: {actual_distance:.4f} Å")
 
     # ------------------------
     # Conformation Search Module
     # ------------------------
 
-    def generate_intermediate_conformations(self, min_distance: float = 5.0) -> List[Structure]:
+    def _create_ligand_copy(self, base_ligand: Structure) -> Structure:
+        """
+        Create a copy of the ligand structure with detached coordinates.
+        
+        Args:
+            base_ligand (Structure): Base ligand structure to copy
+            
+        Returns:
+            Structure: Copy of the ligand structure
+        """
+        ligand_copy = Structure()
+        ligand_copy.atoms = base_ligand.atoms.copy()
+        ligand_copy.coordinates = base_ligand.coordinates.detach().clone()
+        ligand_copy.other_records = base_ligand.other_records.copy()
+        ligand_copy.chains = base_ligand.chains.copy()
+        ligand_copy.residues = base_ligand.residues.copy()
+        ligand_copy.total_charge = base_ligand.total_charge
+        return ligand_copy
+    
+    def generate_intermediate_conformations(self, min_distance: float = 1.0) -> List[Structure]:
         """
         Generate intermediate conformations by gradually decreasing distance between proteins.
         Optimizes search efficiency by stopping early when collisions are detected based on atom distances.
         
         Args:
-            min_distance (float): Minimum distance between residue groups (Å)
+            min_distance (float): Minimum distance between residue groups (Å), reduced for better docking
             
         Returns:
             List[Structure]: List of intermediate ligand conformations
@@ -282,27 +264,14 @@ class Docking:
         # Calculate initial centers and vectors
         rec_group_center = self.calculate_center(self.receptor, self.receptor_group)
         lig_group_center = self.calculate_center(self.ligand, self.ligand_group)
-       
-        # Calculate initial distance between residue groups
-        initial_distance = torch.norm(rec_group_center - lig_group_center).item()
-        
-        # Start from max_dist or initial_distance, whichever is larger
-        current_distance = max(initial_distance, self.max_dist)
-        
-        self.logger.info(f"  search start distance: {current_distance:.2f} Å")
+
         count = 0
         max_iterations = 1000  # Safety counter to prevent infinite loops
         
         # Generate conformations at different distances
         while current_distance > min_distance and count < max_iterations:
-            # Create copy of ligand with detached coordinates to avoid deepcopy issues
-            ligand_copy = Structure()
-            ligand_copy.atoms = self.ligand.atoms.copy()
-            ligand_copy.coordinates = self.ligand.coordinates.detach().clone()
-            ligand_copy.other_records = self.ligand.other_records.copy()
-            ligand_copy.chains = self.ligand.chains.copy()
-            ligand_copy.residues = self.ligand.residues.copy()
-            ligand_copy.total_charge = self.ligand.total_charge
+            # Create copy of ligand with detached coordinates
+            ligand_copy = self._create_ligand_copy(self.ligand)
             
             # Calculate translation vector to achieve the current distance
             delta = rec_group_center - lig_group_center
@@ -318,7 +287,7 @@ class Docking:
             translation = target_lig_group_center - lig_group_center
             
             # First check for collisions before calculating energy - more efficient
-            collision_threshold = 1.0  # Minimum allowed distance between any two atoms (Å)
+            collision_threshold = 0.5  # Minimum allowed distance between any two atoms (Å), reduced for better docking
             
             # Translate ligand to the target position
             CoordinateManager(ligand_copy, device=self.device).translate_coordinates(translation)
@@ -335,18 +304,8 @@ class Docking:
             # Find minimum distance
             min_atom_distance = torch.min(all_distances).item()
             
-            # Calculate energy regardless of collision - let energy function penalize bad conformations
-            score, detailed_scores = self.score_conformation(ligand_copy)
-            
-            # Only log collision warning but continue searching
-            if min_atom_distance < collision_threshold:
-                self.logger.warning(f"  Atom collision detected: Minimum atom distance {min_atom_distance:.2f} Å < threshold {collision_threshold:.2f} Å")
-                break
-            # Add conformation to list
-            conformations.append(ligand_copy)
-            energies.append(score)
-            
-            # Dynamic step size adjustment based on energy landscape
+            # Calculate step size before collision check
+            # Dynamic step size adjustment based on energy landscape and current distance
             if len(energies) > 1:
                 energy_change = energies[-1] - energies[-2]
                 if energy_change < 0:  # Energy is decreasing
@@ -354,9 +313,26 @@ class Docking:
                     current_step = min(self.step_size * 1.5, 2.0)
                 else:  # Energy is increasing
                     # Decrease step size by half
-                    current_step = max(self.step_size * 0.5, 0.5)
+                    current_step = max(self.step_size * 0.5, 0.2)
             else:
                 current_step = self.step_size
+            
+            # Use smaller step size at close distances for better precision
+            if current_distance < 10.0:
+                current_step = max(current_step * 0.5, 0.2)
+            
+            # Check for collisions first before calculating energy - more efficient
+            if min_atom_distance < collision_threshold:
+                self.logger.warning(f"  Atom collision detected: Minimum atom distance {min_atom_distance:.2f} Å < threshold {collision_threshold:.2f} Å")
+                # Continue to next iteration instead of breaking
+                current_distance -= current_step
+                continue
+            
+            # Calculate energy only for non-colliding conformations
+            score, detailed_scores = self.score_conformation(ligand_copy)
+            # Add conformation to list
+            conformations.append(ligand_copy)
+            energies.append(score)
             
             # Update current distance
             current_distance -= current_step
@@ -400,14 +376,8 @@ class Docking:
         
         # Create copies of ligand for each rotation
         for i in range(num_rotations):
-            # Create copy of base ligand with detached coordinates to avoid deepcopy issues
-            ligand_copy = Structure()
-            ligand_copy.atoms = base_ligand.atoms.copy()
-            ligand_copy.coordinates = base_ligand.coordinates.detach().clone()
-            ligand_copy.other_records = base_ligand.other_records.copy()
-            ligand_copy.chains = base_ligand.chains.copy()
-            ligand_copy.residues = base_ligand.residues.copy()
-            ligand_copy.total_charge = base_ligand.total_charge
+            # Create copy of base ligand with detached coordinates
+            ligand_copy = self._create_ligand_copy(base_ligand)
             
             # Rotate ligand
             angle = i * rotation_step
@@ -440,13 +410,7 @@ class Docking:
         
         for i in range(num_perturbations):
             # Create copy of initial conformation
-            ligand_copy = Structure()
-            ligand_copy.atoms = initial_conformation.atoms.copy()
-            ligand_copy.coordinates = initial_conformation.coordinates.detach().clone()
-            ligand_copy.other_records = initial_conformation.other_records.copy()
-            ligand_copy.chains = initial_conformation.chains.copy()
-            ligand_copy.residues = initial_conformation.residues.copy()
-            ligand_copy.total_charge = initial_conformation.total_charge
+            ligand_copy = self._create_ligand_copy(initial_conformation)
             
             # Apply random translation to the entire ligand
             random_trans = torch.randn(3, device=self.device) * perturbation_magnitude
@@ -512,10 +476,7 @@ class Docking:
         """
         if not self.receptor:
             return float('inf'), {
-                'van_der_waals': 0.0,
-                'electrostatic': 0.0,
-                'solvent_penalty': 0.0,
-                'distance_penalty': 0.0
+                'electrostatic': 0.0
             }
         
         return self.energy_calculator.score_conformation(
@@ -608,94 +569,74 @@ class Docking:
         if not self.prealign(receptor_residues, ligand_residues, max_dist):
             return []
         
-        # Step 1: Generate intermediate conformations by gradually decreasing distance
-        self.logger.log("="*10+" Start generating intermediate conformations"+"="*10)
+        # Step 1: Generate intermediate conformations
+        self.logger.section("Generating Intermediate Conformations")
         intermediate_conformations = self.generate_intermediate_conformations()
         
-        # Step 2: Score all intermediate conformations
-        self.logger.log("="*10+" Start scoring intermediate conformations"+"="*10)
+        if not intermediate_conformations:
+            return []
+        
+        # Step 2: Score intermediate conformations
+        self.logger.section("Scoring Intermediate Conformations")
         scored_intermediates = []
         for i, conf in enumerate(intermediate_conformations):
             if i % 5 == 0 or i == len(intermediate_conformations) - 1:
-                self.logger.log(f"    Scoring intermediate conformation {i+1}/{len(intermediate_conformations)}...")
+                self.logger.info(f"  Scoring conformation {i+1}/{len(intermediate_conformations)}...")
             score, _ = self.score_conformation(conf)
             scored_intermediates.append((conf, score))
         
-        # Sort intermediate conformations by score
         scored_intermediates.sort(key=lambda x: x[1])
-        
-        # Step 3: Use the lowest energy intermediate conformation as reference
-        if not scored_intermediates:
-            return []
-        
         best_intermediate = scored_intermediates[0][0]
         best_intermediate_score = scored_intermediates[0][1]
-        self.logger.section(f"Best Intermediate Conformation")
-        self.logger.info(f"  Score: {best_intermediate_score:.2f}")
+        self.logger.info(f"Best intermediate score: {best_intermediate_score:.2f}")
         
-        # Step 4: Perform rotation scan from the best intermediate conformation
-        self.logger.section(f"Starting Rotation Scan")
-        self.logger.info(f"  Generating {num_rotations} conformations...")
+        # Step 3: Perform rotation scan
+        self.logger.section("Performing Rotation Scan")
         final_conformations = self.search_conformations(num_rotations, best_intermediate)
-        self.logger.info(f"  Conformation generation completed: Generated {len(final_conformations)} conformations")
         
-        # Step 5: Score all final conformations
-        self.logger.info(f"  Scoring all conformations...")
+        # Step 4: Score final conformations
+        self.logger.info("Scoring final conformations...")
         scored_conformations = []
-        for i, conf in enumerate(tqdm(final_conformations, desc="    Scoring conformations")):
+        for conf in tqdm(final_conformations, desc="Scoring conformations"):
             score, _ = self.score_conformation(conf)
             scored_conformations.append((conf, score))
-        self.logger.info(f"  Conformation scoring completed")
         
-        # Sort by score (lowest first)
-        self.logger.info(f"  Sorting conformations...")
         scored_conformations.sort(key=lambda x: x[1])
-        self.logger.info(f"  Conformation sorting completed")
         
-        # Step 6: Perform systematic sampling around the best conformation to find the optimal structure
+        # Step 5: Systematic sampling around best conformation
         if scored_conformations:
-            self.logger.section(f"Systematic Sampling around Best Conformation")
-            best_rotation_conf = scored_conformations[0][0]
-            best_rotation_score = scored_conformations[0][1]
-            self.logger.info(f"  Starting systematic sampling with {num_perturbations} perturbations...")
-            self.logger.info(f"  Initial best score: {best_rotation_score:.2f}")
+            self.logger.section("Systematic Sampling")
+            best_rotation_conf, best_rotation_score = scored_conformations[0]
+            self.logger.info(f"Initial best score: {best_rotation_score:.2f}")
             
-            # Perform systematic sampling to find the optimal structure
+            # Perform systematic sampling
             best_sampled_conf, best_sampled_score = self.systematic_sampling(
                 best_rotation_conf, num_perturbations, perturbation_magnitude
             )
             
-            self.logger.info(f"  Systematic sampling completed:")
-            self.logger.info(f"  Best sampled score: {best_sampled_score:.2f}")
+            self.logger.info(f"Best sampled score: {best_sampled_score:.2f}")
             
-            # Replace the best conformation if the sampled one is better
+            # Replace if better
             if best_sampled_score < best_rotation_score:
-                self.logger.info(f"  Found better conformation through systematic sampling")
-                # Update the best conformation in the scored list
+                self.logger.info("Found better conformation through systematic sampling")
                 scored_conformations[0] = (best_sampled_conf, best_sampled_score)
                 
-                # Step 7: Perform a second rotation scan around the improved best conformation
-                self.logger.section(f"Second Rotation Scan around Sampled Conformation")
-                self.logger.info(f"  Generating {num_rotations} additional conformations...")
+                # Step 6: Second rotation scan around improved conformation
+                self.logger.section("Second Rotation Scan")
                 second_rotation_confs = self.search_conformations(num_rotations, best_sampled_conf)
-                self.logger.info(f"  Second rotation scan completed: Generated {len(second_rotation_confs)} conformations")
                 
-                # Score the additional conformations
-                self.logger.info(f"  Scoring second rotation scan conformations...")
+                # Score additional conformations
                 second_scored_confs = []
-                for conf in tqdm(second_rotation_confs, desc="    Scoring second rotation conformations"):
+                for conf in tqdm(second_rotation_confs, desc="Scoring second rotation conformations"):
                     score, _ = self.score_conformation(conf)
                     second_scored_confs.append((conf, score))
                 
-                # Merge and re-sort all conformations
-                self.logger.info(f"  Merging and re-sorting all conformations...")
+                # Merge and re-sort
                 all_conformations = scored_conformations + second_scored_confs
                 all_conformations.sort(key=lambda x: x[1])
-                
-                # Return top conformations
                 return all_conformations
             else:
-                self.logger.info(f"  Original best conformation remains optimal")
+                self.logger.info("Original best conformation remains optimal")
         
         return scored_conformations
     

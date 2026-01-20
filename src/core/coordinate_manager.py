@@ -31,8 +31,9 @@ class CoordinateManager:
         Args:
             translation (torch.Tensor): 3-element tensor containing [dx, dy, dz]
         """
-        # Ensure coordinates are on the correct device
+        # Ensure both coordinates and translation are on the correct device
         coords = self.structure.coordinates.to(self.device)
+        translation = translation.to(self.device)
         # Directly update the tensor coordinates
         self.structure.coordinates = coords + translation
     
@@ -45,8 +46,10 @@ class CoordinateManager:
             angle (float): Rotation angle in degrees
             center (torch.Tensor): Rotation center
         """
-        # Ensure coordinates are on the correct device
+        # Ensure all tensors are on the correct device
         coords = self.structure.coordinates.to(self.device)
+        axis = axis.to(self.device)
+        center = center.to(self.device)
         
         # Normalize axis
         axis = axis / torch.norm(axis)

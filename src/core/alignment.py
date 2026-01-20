@@ -7,7 +7,7 @@ Implements a simplified protein alignment algorithm for receptor-ligand docking.
 """
 
 import torch
-from typing import List, Dict
+from typing import List
 from src.models.structure import Structure
 from src.core.coordinate_manager import CoordinateManager
 
@@ -76,7 +76,7 @@ def calculate_rotation_parameters(current_vec: torch.Tensor, desired_vec: torch.
     desired_norm = normalize_vector(desired_vec)
     
     # Calculate cross product for rotation axis
-    cross = torch.cross(current_norm, desired_norm)
+    cross = torch.cross(current_norm, desired_norm, dim=0)
     cross_norm = torch.norm(cross)
     
     # Check if vectors are colinear
@@ -95,61 +95,36 @@ def calculate_rotation_parameters(current_vec: torch.Tensor, desired_vec: torch.
     return rotation_axis, angle_deg.item()
 
 
-def align_receptor(receptor: Structure, receptor_target_indices: List[int]) -> None:
+def _align_protein(structure: Structure, target_indices: List[int], direction: str) -> None:
     """
-    Align receptor protein:
-    1. Translate to place center at origin
-    2. Rotate to align target group center with positive z-axis
+    Generic protein alignment function.
     
     Args:
-        receptor (Structure): Receptor protein structure
-        receptor_target_indices (List[int]): Indices of atoms in receptor target group
+        structure (Structure): Protein structure
+        target_indices (List[int]): Indices of atoms in the target group
+        direction (str): 'positive' for positive z-axis, 'negative' for negative z-axis
     """
-    # Step 1: Translate receptor center to origin
-    rec_center = calculate_protein_center(receptor)
-    translation = -rec_center  # Vector to move center to origin
-    coord_manager = CoordinateManager(receptor)
+    coord_manager = CoordinateManager(structure)
+    
+    # Step 1: Translate center to origin
+    center = calculate_protein_center(structure)
+    translation = -center
     coord_manager.translate_coordinates(translation)
     
-    # Step 2: Calculate target group center
-    rec_target = calculate_group_center(receptor, receptor_target_indices)
-    
-    # Step 3: Rotate to align target group with positive z-axis
-    current_vec = rec_target
-    desired_vec = torch.tensor([0.0, 0.0, 1.0], device=current_vec.device)
-    
-    rotation_axis, angle = calculate_rotation_parameters(current_vec, desired_vec)
-    
-    if rotation_axis is not None and angle > 1e-6:
-        coord_manager.rotate_around_axis(rotation_axis, angle, torch.zeros(3, device=rotation_axis.device))
-
-
-def align_ligand(ligand: Structure, ligand_target_indices: List[int]) -> None:
-    """
-    Align ligand protein:
-    1. Rotate to align center-to-target-group vector with negative z-axis
-    2. This ensures ligand target group faces toward receptor target group
-    
-    Args:
-        ligand (Structure): Ligand protein structure
-        ligand_target_indices (List[int]): Indices of atoms in ligand target group
-    """
-    # Step 1: Calculate ligand center and target group center
-    lig_center = calculate_protein_center(ligand)
-    lig_target = calculate_group_center(ligand, ligand_target_indices)
-    
     # Step 2: Calculate vector from center to target group
-    current_vec = lig_target - lig_center
+    target = calculate_group_center(structure, target_indices)
+    current_vec = target  # Since center is now at origin
     
-    # Step 3: Rotate to align vector with negative z-axis
-    desired_vec = torch.tensor([0.0, 0.0, -1.0], device=current_vec.device)
+    # Step 3: Rotate to align with desired z-axis direction
+    if direction == 'positive':
+        desired_vec = torch.tensor([0.0, 0.0, 1.0], device=current_vec.device, dtype=current_vec.dtype)
+    else:
+        desired_vec = torch.tensor([0.0, 0.0, -1.0], device=current_vec.device, dtype=current_vec.dtype)
     
     rotation_axis, angle = calculate_rotation_parameters(current_vec, desired_vec)
     
     if rotation_axis is not None and angle > 1e-6:
-        coord_manager = CoordinateManager(ligand)
-        coord_manager.rotate_around_axis(rotation_axis, angle, lig_center)
-
+        coord_manager.rotate_around_axis(rotation_axis, angle, torch.zeros(3, device=rotation_axis.device, dtype=current_vec.dtype))
 
 def align_proteins(receptor: Structure, receptor_target_indices: List[int], 
                    ligand: Structure, ligand_target_indices: List[int]) -> None:
@@ -163,49 +138,11 @@ def align_proteins(receptor: Structure, receptor_target_indices: List[int],
         ligand_target_indices (List[int]): Indices of atoms in ligand target group
     """
     # Align receptor first
-    align_receptor(receptor, receptor_target_indices)
-    
+    _align_protein(receptor, receptor_target_indices, 'positive')
     # Then align ligand
-    align_ligand(ligand, ligand_target_indices)
+    _align_protein(ligand, ligand_target_indices, 'negative')
+    
+    # After alignment, both proteins are at (0, 0, 0)
+    # We need to separate them along the z-axis to avoid immediate atom collisions
 
 
-def validate_alignment(receptor: Structure, receptor_target_indices: List[int], 
-                       ligand: Structure, ligand_target_indices: List[int]) -> Dict[str, bool]:
-    """
-    Validate alignment accuracy against success criteria.
-    
-    Args:
-        receptor (Structure): Aligned receptor protein
-        receptor_target_indices (List[int]): Receptor target group indices
-        ligand (Structure): Aligned ligand protein
-        ligand_target_indices (List[int]): Ligand target group indices
-        
-    Returns:
-        Dict[str, bool]: Validation results for each success criterion
-    """
-    # Check receptor center at origin
-    rec_center = calculate_protein_center(receptor)
-    rec_center_at_origin = torch.allclose(rec_center, torch.zeros(3), atol=1e-3)
-    
-    # Check receptor target group on positive z-axis
-    rec_target = calculate_group_center(receptor, receptor_target_indices)
-    rec_target_on_z = torch.allclose(rec_target[:2], torch.zeros(2), atol=1e-3) and rec_target[2] > 0
-    
-    # Check ligand vector colinear with z-axis
-    lig_center = calculate_protein_center(ligand)
-    lig_target = calculate_group_center(ligand, ligand_target_indices)
-    lig_vec = lig_target - lig_center
-    lig_vec_colinear = torch.allclose(lig_vec[:2], torch.zeros(2), atol=1e-3)
-    
-    # Check ligand target faces receptor target
-    # Negative z-component means vector points toward positive z (receptor target direction)
-    lig_target_faces_receptor = lig_vec[2] < 0
-    
-    return {
-        "receptor_center_at_origin": rec_center_at_origin,
-        "receptor_target_on_positive_z": rec_target_on_z,
-        "ligand_vector_colinear_with_z": lig_vec_colinear,
-        "ligand_target_faces_receptor": lig_target_faces_receptor,
-        "all_criteria_met": all([rec_center_at_origin, rec_target_on_z, 
-                               lig_vec_colinear, lig_target_faces_receptor])
-    }

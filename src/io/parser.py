@@ -7,7 +7,6 @@ Handles PDB file reading and parsing.
 """
 
 from typing import List, Optional
-import torch
 from src.models.structure import Structure
 from src.models.atom import PDBAtom
 from src.utils.logger import Logger
@@ -134,6 +133,14 @@ class PDBParser:
             b_factor = float(line[60:66].strip())  # 61-66: Temperature factor
             element = line[76:78].strip()  # 77-78: Element symbol
             charge = line[78:80].strip()  # 79-80: Charge
+            
+            # Check if this is a hydrogen atom (element is H or atom name starts with H)
+            is_hydrogen = element == 'H' or (atom_name and atom_name[0] == 'H')
+            
+            # Skip hydrogen atoms
+            if is_hydrogen:
+                self.logger.debug(f"Skipping hydrogen atom: {atom_serial} {atom_name} {res_name} {chain_id}{res_seq}")
+                return True
             
             # Create atom object
             atom = PDBAtom(record_type, atom_serial, atom_name, alt_loc, res_name, 

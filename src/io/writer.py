@@ -82,27 +82,42 @@ class PDBWriter:
         for record in header_records:
             pdb_lines.append(record)
         
-        # Write atom records
+        # Write atom records with TER separators between chains
         self.logger.debug(f"Writing {len(structure.atoms)} atom records")
-        for atom, coord in zip(structure.atoms, structure.coordinates):
-            x, y, z = coord
-            # Format ATOM/HETATM record according to PDB spec
-            line = format_pdb_line(
-                atom.record_type,
-                atom.atom_serial,
-                atom.atom_name,
-                atom.alt_loc,
-                atom.res_name,
-                atom.chain_id,
-                atom.res_seq,
-                atom.i_code,
-                x, y, z,
-                atom.occupancy,
-                atom.b_factor,
-                atom.element,
-                atom.charge
-            )
-            pdb_lines.append(line)
+        if structure.atoms:
+            current_chain = structure.atoms[0].chain_id
+            for atom, coord in zip(structure.atoms, structure.coordinates):
+                # Check if chain has changed
+                if atom.chain_id != current_chain:
+                    # Add TER separator (simplified format)
+                    ter_line = "TER"
+                    pdb_lines.append(ter_line)
+                    current_chain = atom.chain_id
+                
+                x, y, z = coord
+                # Format ATOM/HETATM record according to PDB spec
+                line = format_pdb_line(
+                    atom.record_type,
+                    atom.atom_serial,
+                    atom.atom_name,
+                    atom.alt_loc,
+                    atom.res_name,
+                    atom.chain_id,
+                    atom.res_seq,
+                    atom.i_code,
+                    x, y, z,
+                    atom.occupancy,
+                    atom.b_factor,
+                    atom.element,
+                    atom.charge
+                )
+                pdb_lines.append(line)
+            
+            # Add final TER at the end of all atoms
+            if structure.atoms:
+                # Add simplified TER record
+                final_ter_line = "TER"
+                pdb_lines.append(final_ter_line)
         
         # Write CONECT records after atom records (before TER/END)
         self.logger.debug(f"Writing {len(conect_records)} CONECT records")
