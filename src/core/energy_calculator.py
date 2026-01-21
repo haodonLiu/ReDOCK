@@ -11,6 +11,7 @@ Handles all energy calculation logic for protein-protein docking, including:
 """
 
 from typing import List, Tuple, Dict
+import math
 import torch
 from src.models.structure import Structure
 from src.models.force_field import ForceField
@@ -195,7 +196,14 @@ class EnergyCalculator:
         # Convert from kJ/mol to kcal/mol
         vdw_energy = vdw_energy * 0.239
         
+        # Ensure no inf or nan values
+        vdw_energy = torch.nan_to_num(vdw_energy, nan=10000.0, posinf=10000.0, neginf=-10000.0)
+        
         total_energy = torch.sum(vdw_energy).item()
+        
+        # Ensure total energy is finite
+        if not math.isfinite(total_energy):
+            total_energy = 10000.0
         
         return float(total_energy)
     
@@ -316,7 +324,16 @@ class EnergyCalculator:
         electrostatic_energy = electrostatic_energy * cutoff_mask.float()
         electrostatic_energy = torch.clamp(electrostatic_energy, -10000.0, 10000.0)
         
-        return float(torch.sum(electrostatic_energy).item())
+        # Ensure no inf or nan values
+        electrostatic_energy = torch.nan_to_num(electrostatic_energy, nan=0.0, posinf=10000.0, neginf=-10000.0)
+        
+        total_energy = torch.sum(electrostatic_energy).item()
+        
+        # Ensure total energy is finite
+        if not math.isfinite(total_energy):
+            total_energy = 0.0
+        
+        return float(total_energy)
     
     def calculate_electrostatic_forces(self, receptor: Structure, ligand: Structure, cutoff: float = 1.2) -> torch.Tensor:
         """
@@ -382,8 +399,8 @@ class EnergyCalculator:
                               rec_group_indices: List[int], lig_group_indices: List[int],
                               bias_strength: float = 100.0) -> torch.Tensor:
         """
-        Calculate total forces on ligand atoms, including only VDW and bias forces.
-        Bias force increases with distance and is always stronger than VDW forces.
+        Calculate total forces on ligand atoms, including VDW, electrostatic, and bias forces.
+        All forces are scaled to be in the same magnitude range.
         
         Args:
             receptor (Structure): Receptor protein structure
@@ -395,8 +412,14 @@ class EnergyCalculator:
         Returns:
             torch.Tensor: Total forces on ligand atoms (shape: [num_ligand_atoms, 3])
         """
-        # Calculate VDW forces
+        # Calculate all force components
         vdw_forces = self.calculate_vdw_forces(receptor, ligand)
+        electrostatic_forces = self.calculate_electrostatic_forces(receptor, ligand)
+        
+        # Scale factors to bring all forces to similar magnitude
+        vdw_scale = 1.0
+        electrostatic_scale = 0.01  # Scale down electrostatic forces
+        bias_scale = 1.0
         
         # Calculate bias force towards receptor target group
         # Get centers of target groups
@@ -411,18 +434,18 @@ class EnergyCalculator:
         bias_direction = bias_direction / torch.norm(bias_direction)
 
         # Make bias force increase with distance - the farther away, the stronger the bias
-        # Distance-based bias: bias strength = base_strength * (1 + current_distance / 10.0)
-        distance_based_bias = bias_strength * current_distance * 4
+        # Distance-based bias: bias strength = base_strength * (current_distance + 1) for gradual increase
+        distance_based_bias = bias_strength * (current_distance + 1)**2
         
-        # Ensure bias force is always stronger than VDW forces
-        effective_bias_strength = distance_based_bias**1.5 
+        # Scale bias force to match other forces
+        effective_bias_strength = distance_based_bias
         
         # Apply bias force to all ligand atoms (pointing towards receptor target group)
         bias_force = bias_direction * effective_bias_strength
         bias_forces = torch.ones(ligand.coordinates.shape[0], 3, device=self.device) * bias_force
         
-        # Calculate total force - only VDW + bias (no electrostatic)
-        total_forces = vdw_forces + bias_forces
+        # Calculate total force - all components with appropriate scaling
+        total_forces = (vdw_forces * vdw_scale) + (electrostatic_forces * electrostatic_scale) + (bias_forces * bias_scale)
         
         return total_forces
     

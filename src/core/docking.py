@@ -7,7 +7,6 @@ Handles protein-protein docking conformation search with PyTorch acceleration.
 """
 
 import math
-from copy import deepcopy
 from typing import List, Tuple, Dict
 import torch
 from src.core.alignment import calculate_rotation_parameters
@@ -471,7 +470,7 @@ class Docking:
         self.logger.info(f"Receptor vector direction: ({rec_vector[0]:.4f}, {rec_vector[1]:.4f}, {rec_vector[2]:.4f})")
         self.logger.info(f"Ligand vector direction: ({lig_vector[0]:.4f}, {lig_vector[1]:.4f}, {lig_vector[2]:.4f})")
         
-        # Final verification: Ensure residue group distance >= ligand center to receptor residue group distance
+        # Final verification: Ensure residue group distance <= ligand center to receptor residue group distance
         ligand_to_receptor_group = torch.norm(final_ligand_center - final_receptor_group_center).item()
         self.logger.info(f"Ligand center to receptor residue group distance: {ligand_to_receptor_group:.4f} Å")
         
@@ -796,51 +795,8 @@ class Docking:
                     self.logger.info(f"Adjusted position: Distance = {final_distance:.4f} Å, VDW = {final_vdw:.2f}")
                     break
         
-        # Ensure residue group distance < protein center distance
-        final_receptor_center = self.receptor_center
-        final_ligand_center = self.ligand_center
-        center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
-        
-        if final_distance >= center_distance:
-            self.logger.info(f"Residue group distance ({final_distance:.4f} Å) >= protein center distance ({center_distance:.4f} Å), adjusting ligand position")
-            
-            # Calculate the vector from ligand residue group to ligand geometric center
-            # We'll move the ligand so that its residue group is closer to its geometric center
-            ligand_residue_to_center = final_ligand_center - final_ligand_group_center
-            
-            # Apply this vector to move the ligand's residue group towards its geometric center
-            # This will increase the protein center distance while keeping the residue group distance similar
-            coord_manager.translate_coordinates(ligand_residue_to_center)
-            
-            # Recalculate distances after adjustment
-            final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
-            final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
-            final_receptor_center = self.receptor_center
-            final_ligand_center = self.ligand_center
-            center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
-            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-            
-            self.logger.info(f"After adjustment: Residue group distance = {final_distance:.4f} Å, Protein center distance = {center_distance:.4f} Å, VDW = {final_vdw:.2f}")
-            
-            # If still not satisfied, move ligand further away from receptor
-            if final_distance >= center_distance:
-                # Calculate direction from receptor to ligand
-                away_dir = final_ligand_center - final_receptor_center
-                away_dir_normalized = away_dir / torch.norm(away_dir)
-                
-                # Move ligand further away
-                additional_adjustment = away_dir_normalized * 5.0
-                coord_manager.translate_coordinates(additional_adjustment)
-                
-                # Recalculate distances again
-                final_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
-                final_distance = torch.norm(receptor_group_center - final_ligand_group_center).item()
-                final_receptor_center = self.receptor_center
-                final_ligand_center = self.ligand_center
-                center_distance = torch.norm(final_receptor_center - final_ligand_center).item()
-                final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-                
-                self.logger.info(f"After moving ligand further away: Residue group distance = {final_distance:.4f} Å, Protein center distance = {center_distance:.4f} Å, VDW = {final_vdw:.2f}")
+        # Removed old condition check - we now use the correct condition below (lines 860-893)
+        # The correct condition is: residue group distance <= ligand center to receptor residue group distance
         
         # Calculate distances for verification
         final_receptor_center = self.receptor_center
@@ -1212,111 +1168,235 @@ class Docking:
         
         self.logger.info(f"Initial positioning: Ligand residue group {current_distance:.2f} Å from receptor residue group")
         
-        # Step 2: Molecular dynamics simulation
-        self.logger.info("Step 2: Molecular Dynamics Simulation")
+        # Step 2: Enhanced molecular dynamics simulation with all force components
+        self.logger.info("Step 2: Enhanced Molecular Dynamics Simulation with Electrostatic Forces")
         
         # Simulation parameters
         num_steps = 10000
-        time_step = 0.0001  # ps
-        friction = 0.1  # Damping factor
-        bias_strength = 100000.0  # Strength of bias force towards receptor group
-        temperature = 300.0  # K
-        
-        # Mass for atoms (assuming all atoms have same mass for simplicity)
-        atom_mass = torch.tensor(12.0, device=self.device)  # Carbon mass in amu
+        time_step = 0.01  # Small time step for stability
+        friction = 0.9  # Damping factor for velocity
         
         # Save original position for reference
         original_position = self.ligand.coordinates.clone()
-        
-        # Initialize velocity
-        velocity = torch.zeros_like(self.ligand.coordinates, device=self.device)
         
         # Store conformations
         conformations = []
         best_energy = float('inf')
         best_conformation = None
         
-        # MD simulation loop
+        # Initialize velocity
+        velocity = torch.zeros_like(self.ligand.coordinates, device=self.device)
+        
+        # Enhanced MD simulation loop that uses all force components including electrostatic
         for step in range(num_steps):
-            # Calculate total forces including bias force
+            # Save current position before move
+            current_position = self.ligand.coordinates.clone()
+            
+            # Calculate all force components including VDW, electrostatic, and bias
             forces = self.energy_calculator.calculate_total_forces(
-                self.receptor, self.ligand, 
+                self.receptor, self.ligand,
                 self.receptor_group, self.ligand_group,
-                bias_strength=bias_strength
+                bias_strength=5.0  # Adjusted bias strength for balance
             )
             
-            # Update velocity using Verlet integration
-            velocity = velocity * (1.0 - friction * time_step) + (forces / atom_mass) * time_step
+            # Ensure forces are finite
+            forces = torch.nan_to_num(forces, nan=0.0, posinf=1000.0, neginf=-1000.0)
             
-            # Add random noise for temperature control (Langevin dynamics)
-            noise = torch.sqrt(2.0 * friction * temperature * 0.001987 / atom_mass) * torch.randn_like(velocity, device=self.device)
-            velocity += noise
+            # Calculate average force on all atoms (for rigid body motion)
+            avg_force = torch.mean(forces, dim=0)
             
-            # Update coordinates
-            self.ligand.coordinates += velocity * time_step
+            # Update velocity using force (F = ma, assume mass=1 for simplicity)
+            velocity = velocity * friction + avg_force * time_step
             
-            # Calculate current energy and distance
+            # Limit maximum velocity to prevent excessive movement
+            max_velocity = 1.0  # Å per step
+            velocity = torch.clamp(velocity, -max_velocity, max_velocity)
+            
+            # Calculate translation step from average velocity
+            avg_velocity = torch.mean(velocity, dim=0)
+            translation_step = avg_velocity
+            
+            # Apply translation using CoordinateManager (maintains rigidity)
+            coord_manager.translate_coordinates(translation_step)
+            
+            # Calculate current energy
             current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
             current_electrostatic = self.energy_calculator.calculate_electrostatic_energy(self.receptor, self.ligand)
             total_energy = current_vdw + current_electrostatic
             
-            # Calculate residue group distance
+            # Recalculate distance after move
             current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
-            current_group_distance = torch.norm(receptor_group_center - current_ligand_group_center).item()
+            updated_distance = torch.norm(receptor_group_center - current_ligand_group_center).item()
             
-            # Periodically save conformation
-            if step % 100 == 0:
-                # Check if conformation meets criteria
-                if (current_vdw < 10000.0 and 
-                    2.0 <= current_group_distance <= 5.0 and 
-                    not math.isnan(total_energy)):
-                    
-                    conformation = self._create_ligand_copy(self.ligand)
-                    conformations.append(conformation)
-                    
-                    # Update best conformation
-                    if total_energy < best_energy:
-                        best_energy = total_energy
-                        best_conformation = conformation
-                        self.logger.info(f"Step {step}: New best conformation - Energy: {total_energy:.2f} kcal/mol, Distance: {current_group_distance:.2f} Å")
+            # Ensure all values are finite
+            if not (math.isfinite(current_vdw) and math.isfinite(updated_distance) and math.isfinite(total_energy)):
+                self.logger.warning(f"Step {step}: Invalid values detected, reverting move")
+                self.ligand.coordinates = current_position.clone()
+                velocity = torch.zeros_like(velocity, device=self.device)  # Reset velocity
+                continue
+            
+            # Add collision detection: if VDW energy is too high, try rotation first
+            vdw_threshold = 500000.0  # Increased threshold for more exploration
+            if current_vdw > vdw_threshold:
+                self.logger.warning(f"Step {step}: Collision detected (VDW = {current_vdw:.2f}), attempting rotation to resolve")
                 
-                self.logger.info(f"Step {step}: Energy = {total_energy:.2f} kcal/mol, VDW = {current_vdw:.2f} kcal/mol, Distance = {current_group_distance:.2f} Å")
+                # Try multiple rotation attempts to resolve collision
+                rotation_success = False
+                for rotation_attempt in range(3):
+                    # Calculate rotation axis that might resolve collision
+                    # Use random axis with strong bias towards receptor to move atoms away from collision
+                    rotation_direction = receptor_group_center - current_ligand_group_center
+                    rotation_direction = rotation_direction / torch.norm(rotation_direction)
+                    
+                    # More random axis for better chance of resolving collision
+                    random_axis = torch.randn(3, device=self.device) * 0.7 + rotation_direction * 0.3
+                    random_axis = random_axis / torch.norm(random_axis)
+                    
+                    # Larger rotation angle to try to move atoms out of collision
+                    random_angle = (torch.rand(1, device=self.device) - 0.5) * 10.0  # ±5 degrees for more dramatic movement
+                    
+                    # Apply rotation using CoordinateManager (maintains rigidity)
+                    coord_manager.rotate_around_axis(
+                        random_axis,
+                        random_angle.item(),
+                        current_ligand_group_center
+                    )
+                    
+                    # Recalculate VDW energy after rotation
+                    rotated_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                    rotated_electrostatic = self.energy_calculator.calculate_electrostatic_energy(self.receptor, self.ligand)
+                    rotated_energy = rotated_vdw + rotated_electrostatic
+                    rotated_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                    rotated_distance = torch.norm(receptor_group_center - rotated_ligand_group_center).item()
+                    
+                    self.logger.info(f"  Attempt {rotation_attempt+1}: VDW after rotation = {rotated_vdw:.2f} kcal/mol")
+                    
+                    # Check if rotation resolved the collision
+                    if rotated_vdw <= vdw_threshold:
+                        # Collision resolved by rotation
+                        self.logger.info(f"✓ Collision resolved with rotation! New VDW = {rotated_vdw:.2f} kcal/mol")
+                        
+                        # Update values after successful rotation
+                        current_vdw = rotated_vdw
+                        current_electrostatic = rotated_electrostatic
+                        total_energy = rotated_energy
+                        updated_distance = rotated_distance
+                        current_ligand_group_center = rotated_ligand_group_center
+                        
+                        rotation_success = True
+                        break
+                    else:
+                        # Rotation didn't resolve collision, keep the rotated position and try next rotation
+                        # We don't revert yet, as the next rotation might resolve it
+                        pass
+                
+                # After multiple rotation attempts, check if collision was resolved
+                if not rotation_success:
+                    # Collision still present after rotation attempts, revert the move
+                    self.logger.warning(f"✗ Could not resolve collision with rotation, reverting to previous position")
+                    self.ligand.coordinates = current_position.clone()
+                    velocity = torch.zeros_like(velocity, device=self.device)  # Reset velocity
+                    continue
+                else:
+                    # Collision resolved, continue with the rotated position
+                    self.logger.info(f"✓ Collision resolved, continuing with rotated position")
+            
+            # Save conformation if it meets criteria
+            if (current_vdw < 10000.0 and 
+                2.0 <= updated_distance <= 5.0 and 
+                math.isfinite(total_energy)):
+                
+                conformation = self._create_ligand_copy(self.ligand)
+                conformations.append(conformation)
+                
+                # Update best conformation
+                if total_energy < best_energy:
+                    best_energy = total_energy
+                    best_conformation = conformation
+                    self.logger.info(f"✓ New best conformation found!")
+                    self.logger.info(f"  Best Energy: {best_energy:.2f} kcal/mol, Best Distance: {updated_distance:.2f} Å")
+            
+            # Additional summary every 10 steps
+            if step % 100 == 0:
+                self.logger.info(f"--- Step {step} Summary ---")
+                self.logger.info(f"  Conformations saved: {len(conformations)}")
+                self.logger.info(f"  Best energy so far: {best_energy:.2f} kcal/mol")
+                self.logger.info(f"  Current distance to target: {updated_distance:.2f} Å (target range: 2.0-5.0 Å)")
+                self.logger.info(f"  VDW energy status: {'Low' if current_vdw < 10000.0 else 'High'} (<10000.0 is good)")
+            
+            # Allow rotation during dynamics simulation
+            if step % 5 == 0:  # More frequent rotation
+                # Calculate rotation axis that points towards receptor residue group for better orientation
+                # This ensures ligand residues tend to point towards receptor residues during rotation
+                rotation_direction = receptor_group_center - current_ligand_group_center
+                rotation_direction = rotation_direction / torch.norm(rotation_direction)
+                
+                # Generate random axis that has a component towards the receptor (biased rotation)
+                random_axis = torch.randn(3, device=self.device) * 0.5 + rotation_direction * 0.5
+                random_axis = random_axis / torch.norm(random_axis)
+                
+                # Increase rotation angle range slightly (±3 degrees) for more exploration
+                random_angle = (torch.rand(1, device=self.device) - 0.5) * 6.0  # ±3 degrees
+                
+                # Calculate energy before rotation for comparison
+                energy_before_rotation = current_vdw + current_electrostatic
+                
+                # Apply rotation using CoordinateManager (maintains rigidity)
+                coord_manager.rotate_around_axis(
+                    random_axis,
+                    random_angle.item(),
+                    current_ligand_group_center
+                )
+                
+                # Recalculate energy after rotation to see effect
+                energy_after_rotation = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand) + \
+                                     self.energy_calculator.calculate_electrostatic_energy(self.receptor, self.ligand)
+                
+                # Log rotation details with energy change
+                #self.logger.info(f"  Rotation applied: Axis = [{random_axis[0]:.3f}, {random_axis[1]:.3f}, {random_axis[2]:.3f}], Angle = {random_angle.item():.2f} degrees")
+                #self.logger.info(f"  Energy change from rotation: {energy_before_rotation:.2f} → {energy_after_rotation:.2f} kcal/mol")
+                
+                # Recalculate distance and energy after rotation for next iteration
+                current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+                updated_distance = torch.norm(receptor_group_center - current_ligand_group_center).item()
+                current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+                current_electrostatic = self.energy_calculator.calculate_electrostatic_energy(self.receptor, self.ligand)
+                total_energy = current_vdw + current_electrostatic
         
         # If no conformations found during MD, try additional sampling
         if not conformations:
             self.logger.warning("No conformations found during MD simulation, trying additional sampling")
             
-            # Try random rotations around receptor group
-            for i in range(num_rotations):
-                # Create copy of current ligand
-                ligand_copy = self._create_ligand_copy(self.ligand)
-                
-                # Apply random rotation around receptor group
-                rotation_axis = torch.randn(3, device=self.device)
-                rotation_axis = rotation_axis / torch.norm(rotation_axis)
-                rotation_angle = i * (360.0 / num_rotations)
-                
-                coord_manager = CoordinateManager(ligand_copy, device=self.device)
-                coord_manager.rotate_around_axis(rotation_axis, rotation_angle, receptor_group_center)
-                
-                # Calculate energy and distance
-                vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, ligand_copy)
-                electrostatic_energy = self.energy_calculator.calculate_electrostatic_energy(self.receptor, ligand_copy)
-                total_energy = vdw_energy + electrostatic_energy
-                
-                # Calculate residue group distance
-                lig_group_center = self.calculate_center(ligand_copy, self.ligand_group)
-                group_distance = torch.norm(receptor_group_center - lig_group_center).item()
-                
-                # Check if conformation meets criteria
-                if (vdw_energy < 10000.0 and 
-                    2.0 <= group_distance <= 5.0 and 
-                    not math.isnan(total_energy)):
-                    conformations.append(ligand_copy)
-                    
-                    if total_energy < best_energy:
-                        best_energy = total_energy
-                        best_conformation = ligand_copy
+            # Try systematic translation around receptor group
+            for dx in [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]:
+                for dy in [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]:
+                    for dz in [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]:
+                        # Create copy of original ligand
+                        ligand_copy = self._create_ligand_copy(self.ligand)
+                        
+                        # Apply translation
+                        translation = torch.tensor([dx, dy, dz], device=self.device)
+                        temp_coord_manager = CoordinateManager(ligand_copy, device=self.device)
+                        temp_coord_manager.translate_coordinates(translation)
+                        
+                        # Calculate energy and distance
+                        vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, ligand_copy)
+                        electrostatic_energy = self.energy_calculator.calculate_electrostatic_energy(self.receptor, ligand_copy)
+                        total_energy = vdw_energy + electrostatic_energy
+                        
+                        # Calculate residue group distance
+                        lig_group_center = self.calculate_center(ligand_copy, self.ligand_group)
+                        group_distance = torch.norm(receptor_group_center - lig_group_center).item()
+                        
+                        # Check if conformation meets criteria
+                        if (vdw_energy < 10000.0 and 
+                            2.0 <= group_distance <= 5.0 and 
+                            math.isfinite(total_energy)):
+                            conformations.append(ligand_copy)
+                            
+                            if total_energy < best_energy:
+                                best_energy = total_energy
+                                best_conformation = ligand_copy
         
         # If still no conformations, add current ligand position
         if not conformations:
@@ -1701,7 +1781,11 @@ class Docking:
         # Add receptor atoms with their original coordinates
         for i, atom in enumerate(receptor.atoms):
             coord = receptor.coordinates[i]
-            merged.add_atom(atom, (float(coord[0]), float(coord[1]), float(coord[2])))
+            # Ensure coordinates are finite
+            x = float(coord[0]) if math.isfinite(coord[0]) else 0.0
+            y = float(coord[1]) if math.isfinite(coord[1]) else 0.0
+            z = float(coord[2]) if math.isfinite(coord[2]) else 0.0
+            merged.add_atom(atom, (x, y, z))
         
         # Add TER record after receptor atoms
         merged.add_other_record("TER")
@@ -1709,7 +1793,11 @@ class Docking:
         # Add ligand atoms
         for i, atom in enumerate(ligand.atoms):
             coord = ligand.coordinates[i]
-            merged.add_atom(atom, (float(coord[0]), float(coord[1]), float(coord[2])))
+            # Ensure coordinates are finite
+            x = float(coord[0]) if math.isfinite(coord[0]) else 0.0
+            y = float(coord[1]) if math.isfinite(coord[1]) else 0.0
+            z = float(coord[2]) if math.isfinite(coord[2]) else 0.0
+            merged.add_atom(atom, (x, y, z))
         
         # Add final TER and END records
         merged.add_other_record("TER")
