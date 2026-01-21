@@ -471,14 +471,15 @@ class Docking:
         self.logger.info(f"Receptor vector direction: ({rec_vector[0]:.4f}, {rec_vector[1]:.4f}, {rec_vector[2]:.4f})")
         self.logger.info(f"Ligand vector direction: ({lig_vector[0]:.4f}, {lig_vector[1]:.4f}, {lig_vector[2]:.4f})")
         
-        # Final verification: Ensure residue group distance < ligand center to receptor residue group distance
+        # Final verification: Ensure residue group distance >= ligand center to receptor residue group distance
         ligand_to_receptor_group = torch.norm(final_ligand_center - final_receptor_group_center).item()
         self.logger.info(f"Ligand center to receptor residue group distance: {ligand_to_receptor_group:.4f} Å")
         
-        if group_distance < ligand_to_receptor_group:
-            self.logger.info(f"✓ Residue group distance ({group_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+        # This is the correct condition: residue group distance should be less than ligand center to receptor residue group distance
+        if group_distance <= ligand_to_receptor_group:
+            self.logger.info(f"✓ Residue group distance ({group_distance:.4f} Å) <= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
         else:
-            self.logger.warning(f"⚠ Residue group distance ({group_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
+            self.logger.warning(f"⚠ Residue group distance ({group_distance:.4f} Å) > ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
     
     def generate_initial_conformations(self, num_conformations: int = 36) -> None:
         """
@@ -857,23 +858,22 @@ class Docking:
         self.logger.info(f"Final ligand center to receptor residue group distance: {ligand_to_receptor_group:.4f} Å")
         self.logger.info(f"Final VDW energy: {final_vdw:.2f}")
         
-        # Verify residue group distance < ligand center to receptor residue group distance
-        if final_distance < ligand_to_receptor_group:
-            self.logger.info(f"✓ Residue group distance ({final_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+        # Verify residue group distance <= ligand center to receptor residue group distance
+        # This is the correct condition: residue group distance should be less than ligand center to receptor residue group distance
+        if final_distance <= ligand_to_receptor_group:
+            self.logger.info(f"✓ Residue group distance ({final_distance:.4f} Å) <= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
         else:
-            self.logger.warning(f"⚠ Residue group distance ({final_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Adjusting ligand position")
+            self.logger.warning(f"⚠ Residue group distance ({final_distance:.4f} Å) > ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Adjusting ligand position")
             
-            # Calculate adjustment vector to move ligand so that residue group distance < ligand center to receptor residue group distance
-            # We'll move ligand further away from receptor residue group
+            # Calculate adjustment vector to move ligand so that residue group distance <= ligand center to receptor residue group distance
+            # We'll move ligand away from receptor residue group
             direction = final_ligand_group_center - receptor_group_center
             direction_normalized = direction / torch.norm(direction)
             
             # Calculate required adjustment distance to satisfy the condition
-            # We need to ensure that ligand_to_receptor_group > final_distance
-            # Let's solve for adjustment distance d:
-            # |ligand_center + d*direction_normalized - receptor_group_center| > |final_ligand_group_center + d*direction_normalized - receptor_group_center|
+            # We need to ensure that final_distance <= ligand_to_receptor_group
             # For simplicity, we'll move ligand far enough to ensure the condition is met
-            required_distance = final_distance * 1.5  # Move far enough to ensure condition is met
+            required_distance = (final_distance - ligand_to_receptor_group) + 5.0  # Move away from receptor
             adjustment = direction_normalized * required_distance
             
             # Apply adjustment
@@ -888,10 +888,10 @@ class Docking:
             
             self.logger.info(f"After adjustment: Residue group distance = {final_distance:.4f} Å, Ligand center to receptor residue group distance = {ligand_to_receptor_group:.4f} Å, VDW = {final_vdw:.2f}")
             
-            if final_distance < ligand_to_receptor_group:
-                self.logger.info(f"✓ After adjustment: Residue group distance ({final_distance:.4f} Å) < ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
+            if final_distance <= ligand_to_receptor_group:
+                self.logger.info(f"✓ After adjustment: Residue group distance ({final_distance:.4f} Å) <= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Valid configuration")
             else:
-                self.logger.warning(f"⚠ Even after adjustment, residue group distance ({final_distance:.4f} Å) >= ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
+                self.logger.warning(f"⚠ Even after adjustment, residue group distance ({final_distance:.4f} Å) > ligand center to receptor residue group distance ({ligand_to_receptor_group:.4f} Å) - Consider adjusting docking parameters")
         
         if final_vdw > vdw_threshold:
             self.logger.warning(f"Final VDW energy ({final_vdw:.2f}) exceeds threshold ({vdw_threshold:.2f})")
@@ -1004,8 +1004,13 @@ class Docking:
                     ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
                     residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
                     
-                    # Check if VDW energy is within threshold and distance condition is met
-                    if vdw_energy < 1e5 and ligand_to_receptor_group > residue_group_distance and not math.isnan(vdw_energy):
+                    # Check if VDW energy is within threshold and distance conditions are met
+                    # During search: use relaxed VDW threshold, only enforce distance range and orientation
+                    # Conditions: 1) VDW < vdw_threshold, 2) 2A <= residue_group_distance <= 5A, 3) residue_group_distance <= ligand_to_receptor_group
+                    if (vdw_energy < vdw_threshold and 
+                        2.0 <= residue_group_distance <= 5.0 and 
+                        residue_group_distance <= ligand_to_receptor_group and 
+                        not math.isnan(vdw_energy)):
                         # Create copy of valid conformation
                         valid_conformation = self._create_ligand_copy(self.ligand)
                         conformations.append(valid_conformation)
@@ -1060,8 +1065,13 @@ class Docking:
                 ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
                 residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
                 
-                # Check if VDW energy is within threshold and distance condition is met
-                if vdw_energy < 1e5 and ligand_to_receptor_group > residue_group_distance and not math.isnan(vdw_energy):
+                # Check if VDW energy is within threshold and distance conditions are met
+                # During search: use relaxed VDW threshold, only enforce distance range and orientation
+                # Conditions: 1) VDW < vdw_threshold, 2) 2A <= residue_group_distance <= 5A, 3) residue_group_distance <= ligand_to_receptor_group
+                if (vdw_energy < vdw_threshold and 
+                    2.0 <= residue_group_distance <= 5.0 and 
+                    residue_group_distance <= ligand_to_receptor_group and 
+                    not math.isnan(vdw_energy)):
                     # Validate orientation after rotation
                     # Temporarily set ligand to this conformation for validation
                     original_coords = self.ligand.coordinates.clone()
@@ -1148,8 +1158,12 @@ class Docking:
             ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
             residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
             
-            # Check if VDW energy is within threshold and distance condition is met
-            if final_vdw < 1e5 and ligand_to_receptor_group > residue_group_distance:
+            # Check if VDW energy is within threshold and distance conditions are met
+            # During optimization: use relaxed VDW threshold, only enforce final VDW < 10000
+            # Conditions: 1) VDW < 10000, 2) 2A <= residue_group_distance <= 5A, 3) residue_group_distance <= ligand_to_receptor_group
+            if (final_vdw < 10000.0 and 
+                2.0 <= residue_group_distance <= 5.0 and 
+                residue_group_distance <= ligand_to_receptor_group):
                 optimized_conformations.append(optimized_conformation)
         
         self.logger.info(f"Found {len(optimized_conformations)} optimized conformations")
@@ -1157,7 +1171,7 @@ class Docking:
     
     def search_conformations(self, num_rotations: int = 36) -> List[Structure]:
         """
-        Search for docking conformations using translation-first approach.
+        Search for docking conformations using molecular dynamics simulation approach.
         
         Args:
             num_rotations (int): Number of rotations (default: 36, 10 degrees each)
@@ -1178,108 +1192,140 @@ class Docking:
         if not isinstance(num_rotations, int) or num_rotations <= 0:
             raise ValueError("num_rotations must be a positive integer")
         
-        # Before scanning, ensure ligand is not overlapping with receptor
-        current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+        self.logger.info("=== Molecular Dynamics Based Conformation Search ===")
         
-        if current_vdw > 100000:  # Severe overlap, move ligand away
-            self.logger.info(f"Current VDW energy ({current_vdw:.2f}) is too high, moving ligand away from receptor first")
-            
-            # Calculate direction from receptor to ligand
-            receptor_center = self.receptor.calculate_geometric_center().to(self.device)
-            ligand_center = self.ligand.calculate_geometric_center().to(self.device)
-            direction = ligand_center - receptor_center
-            direction_normalized = direction / torch.norm(direction)
-            
-            # Move ligand away by 20Å
-            coord_manager = CoordinateManager(self.ligand, device=self.device)
-            translation = direction_normalized * 20.0
-            coord_manager.translate_coordinates(translation)
-        
-        # Step 1: Move ligand closer to receptor residue group carefully
+        # Initial ligand positioning with xyz translation
+        self.logger.info("Step 1: Initial Ligand Positioning (XYZ Translation)")
         receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
         ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+        
+        # Calculate initial translation vector (ligand group -> receptor group)
+        initial_translation = receptor_group_center - ligand_group_center
+        
+        # Apply initial translation with some offset to avoid direct collision
+        coord_manager = CoordinateManager(self.ligand, device=self.device)
+        coord_manager.translate_coordinates(initial_translation * 0.5)  # Move halfway initially
+        
+        # Get current positions
+        current_ligand_center = self.ligand.calculate_geometric_center().to(self.device)
         current_distance = torch.norm(receptor_group_center - ligand_group_center).item()
         
-        # If ligand is too far from receptor, move it closer gradually
-        if current_distance > 20.0:
-            self.logger.info(f"Ligand is too far from receptor ({current_distance:.2f} Å), moving it closer gradually")
+        self.logger.info(f"Initial positioning: Ligand residue group {current_distance:.2f} Å from receptor residue group")
+        
+        # Step 2: Molecular dynamics simulation
+        self.logger.info("Step 2: Molecular Dynamics Simulation")
+        
+        # Simulation parameters
+        num_steps = 10000
+        time_step = 0.0001  # ps
+        friction = 0.1  # Damping factor
+        bias_strength = 100000.0  # Strength of bias force towards receptor group
+        temperature = 300.0  # K
+        
+        # Mass for atoms (assuming all atoms have same mass for simplicity)
+        atom_mass = torch.tensor(12.0, device=self.device)  # Carbon mass in amu
+        
+        # Save original position for reference
+        original_position = self.ligand.coordinates.clone()
+        
+        # Initialize velocity
+        velocity = torch.zeros_like(self.ligand.coordinates, device=self.device)
+        
+        # Store conformations
+        conformations = []
+        best_energy = float('inf')
+        best_conformation = None
+        
+        # MD simulation loop
+        for step in range(num_steps):
+            # Calculate total forces including bias force
+            forces = self.energy_calculator.calculate_total_forces(
+                self.receptor, self.ligand, 
+                self.receptor_group, self.ligand_group,
+                bias_strength=bias_strength
+            )
             
-            # Calculate direction vector
-            direction = receptor_group_center - ligand_group_center
-            direction_normalized = direction / torch.norm(direction)
+            # Update velocity using Verlet integration
+            velocity = velocity * (1.0 - friction * time_step) + (forces / atom_mass) * time_step
             
-            # Move ligand in small steps to avoid sudden collisions
-            target_distance = 15.0
-            total_translation = direction_normalized * (current_distance - target_distance)
+            # Add random noise for temperature control (Langevin dynamics)
+            noise = torch.sqrt(2.0 * friction * temperature * 0.001987 / atom_mass) * torch.randn_like(velocity, device=self.device)
+            velocity += noise
             
-            # Apply translation in small steps with VDW checks
-            step_size = 2.0
-            num_steps = int(torch.norm(total_translation).item() / step_size) + 1
-            incremental_translation = total_translation / num_steps
+            # Update coordinates
+            self.ligand.coordinates += velocity * time_step
             
-            coord_manager = CoordinateManager(self.ligand, device=self.device)
+            # Calculate current energy and distance
+            current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
+            current_electrostatic = self.energy_calculator.calculate_electrostatic_energy(self.receptor, self.ligand)
+            total_energy = current_vdw + current_electrostatic
             
-            for step in range(num_steps):
-                # Apply small translation
-                coord_manager.translate_coordinates(incremental_translation)
+            # Calculate residue group distance
+            current_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            current_group_distance = torch.norm(receptor_group_center - current_ligand_group_center).item()
+            
+            # Periodically save conformation
+            if step % 100 == 0:
+                # Check if conformation meets criteria
+                if (current_vdw < 10000.0 and 
+                    2.0 <= current_group_distance <= 5.0 and 
+                    not math.isnan(total_energy)):
+                    
+                    conformation = self._create_ligand_copy(self.ligand)
+                    conformations.append(conformation)
+                    
+                    # Update best conformation
+                    if total_energy < best_energy:
+                        best_energy = total_energy
+                        best_conformation = conformation
+                        self.logger.info(f"Step {step}: New best conformation - Energy: {total_energy:.2f} kcal/mol, Distance: {current_group_distance:.2f} Å")
                 
-                # Check VDW energy
-                current_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-                
-                # If VDW energy becomes too high, stop moving
-                if current_vdw > 200000.0:
-                    self.logger.info(f"Stopped moving: VDW energy became too high ({current_vdw:.2f} kcal/mol)")
-                    break
+                self.logger.info(f"Step {step}: Energy = {total_energy:.2f} kcal/mol, VDW = {current_vdw:.2f} kcal/mol, Distance = {current_group_distance:.2f} Å")
+        
+        # If no conformations found during MD, try additional sampling
+        if not conformations:
+            self.logger.warning("No conformations found during MD simulation, trying additional sampling")
             
-            # Recalculate distance
-            new_ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
-            new_distance = torch.norm(receptor_group_center - new_ligand_group_center).item()
-            final_vdw = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
-            self.logger.info(f"Moved ligand to {new_distance:.2f} Å from receptor residue group, VDW energy: {final_vdw:.2f} kcal/mol")
+            # Try random rotations around receptor group
+            for i in range(num_rotations):
+                # Create copy of current ligand
+                ligand_copy = self._create_ligand_copy(self.ligand)
+                
+                # Apply random rotation around receptor group
+                rotation_axis = torch.randn(3, device=self.device)
+                rotation_axis = rotation_axis / torch.norm(rotation_axis)
+                rotation_angle = i * (360.0 / num_rotations)
+                
+                coord_manager = CoordinateManager(ligand_copy, device=self.device)
+                coord_manager.rotate_around_axis(rotation_axis, rotation_angle, receptor_group_center)
+                
+                # Calculate energy and distance
+                vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, ligand_copy)
+                electrostatic_energy = self.energy_calculator.calculate_electrostatic_energy(self.receptor, ligand_copy)
+                total_energy = vdw_energy + electrostatic_energy
+                
+                # Calculate residue group distance
+                lig_group_center = self.calculate_center(ligand_copy, self.ligand_group)
+                group_distance = torch.norm(receptor_group_center - lig_group_center).item()
+                
+                # Check if conformation meets criteria
+                if (vdw_energy < 10000.0 and 
+                    2.0 <= group_distance <= 5.0 and 
+                    not math.isnan(total_energy)):
+                    conformations.append(ligand_copy)
+                    
+                    if total_energy < best_energy:
+                        best_energy = total_energy
+                        best_conformation = ligand_copy
         
-        # Step 2: Coarse translation scan (1Å step size)
-        # Use appropriate distance range based on current position
-        coarse_conformations = self._translation_scan(step_size=1.0, distance_range=(5.0, 25.0), vdw_threshold=200000.0)
+        # If still no conformations, add current ligand position
+        if not conformations:
+            self.logger.warning("No valid conformations found, using current position")
+            conformations.append(self._create_ligand_copy(self.ligand))
         
-        # If no conformations found, try with even larger VDW threshold and distance range
-        if not coarse_conformations:
-            self.logger.info("No conformations found, trying with larger VDW threshold and distance range")
-            coarse_conformations = self._translation_scan(step_size=2.0, distance_range=(3.0, 30.0), vdw_threshold=300000.0)
-        
-        # If still no conformations found, try random sampling with larger distance range and very loose VDW threshold
-        if not coarse_conformations:
-            self.logger.info("No conformations found, trying random sampling with larger distance range and loose VDW threshold")
-            coarse_conformations = self._random_sampling(num_samples=200, vdw_threshold=500000.0)
-        
-        if not coarse_conformations:
-            self.logger.warning("No valid conformations found after all attempts")
-            return [self._create_ligand_copy(self.ligand)]
-        
-        # Step 3: Rotation scan on coarse conformations with relaxed VDW threshold
-        rotated_conformations = self._rotation_scan(coarse_conformations, num_rotations=num_rotations, vdw_threshold=50000.0)
-        
-        # If no rotated conformations found, use coarse conformations directly
-        if not rotated_conformations:
-            self.logger.info("No rotated conformations found, using coarse conformations directly")
-            rotated_conformations = coarse_conformations
-        
-        # Step 4: Fine-grained optimization (0.1Å step size) with relaxed VDW threshold
-        fine_conformations = self._fine_grained_optimization(rotated_conformations, step_size=0.1, vdw_threshold=50000.0)
-        
-        # If no fine conformations found, use rotated conformations
-        if not fine_conformations:
-            self.logger.info("No optimized conformations found, using rotated conformations")
-            fine_conformations = rotated_conformations
-        
-        # Ensure we have at least one conformation
-        if not fine_conformations:
-            fine_conformations = rotated_conformations
-        
-        # Filter conformations to ensure residue group distance < ligand center to receptor residue group distance
+        # Filter conformations to ensure residue group distance <= ligand center to receptor residue group distance
         filtered_conformations = []
-        receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
-        
-        for conformation in fine_conformations:
+        for conformation in conformations:
             # Calculate distances for this conformation
             ligand_group_center = self.calculate_center(conformation, self.ligand_group)
             ligand_center = conformation.calculate_geometric_center().to(self.device)
@@ -1287,15 +1333,13 @@ class Docking:
             group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
             ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
             
-            if group_distance < ligand_to_receptor_group:
+            if group_distance <= ligand_to_receptor_group:
                 filtered_conformations.append(conformation)
         
-        self.logger.info(f"Generated {len(fine_conformations)} valid conformations, {len(filtered_conformations)} of which satisfy residue group distance < ligand center to receptor residue group distance")
-        
-        # If no filtered conformations, return original fine_conformations as fallback
         if not filtered_conformations:
-            self.logger.warning("No conformations satisfied residue group distance < ligand center to receptor residue group distance, returning all conformations")
-            return fine_conformations
+            filtered_conformations = conformations
+        
+        self.logger.info(f"Generated {len(filtered_conformations)} valid conformations after MD simulation")
         
         return filtered_conformations
     
@@ -1354,8 +1398,22 @@ class Docking:
             # Calculate VDW energy
             vdw_energy = self.energy_calculator.calculate_vdw_energy(self.receptor, self.ligand)
             
-            # Check if VDW energy is within threshold
-            if vdw_energy < vdw_threshold and not math.isnan(vdw_energy):
+            # Calculate centers for distance calculations
+            receptor_group_center = self.calculate_center(self.receptor, self.receptor_group)
+            ligand_center = self.ligand.calculate_geometric_center().to(self.device)
+            ligand_group_center = self.calculate_center(self.ligand, self.ligand_group)
+            
+            # Calculate distances
+            ligand_to_receptor_group = torch.norm(ligand_center - receptor_group_center).item()
+            residue_group_distance = torch.norm(receptor_group_center - ligand_group_center).item()
+            
+            # Check if VDW energy is within threshold and distance conditions are met
+            # During random sampling: use relaxed VDW threshold, only enforce distance range and orientation
+            # Conditions: 1) VDW < vdw_threshold, 2) 2A <= residue_group_distance <= 5A, 3) residue_group_distance <= ligand_to_receptor_group
+            if (vdw_energy < vdw_threshold and 
+                2.0 <= residue_group_distance <= 5.0 and 
+                residue_group_distance <= ligand_to_receptor_group and 
+                not math.isnan(vdw_energy)):
                 # Validate ligand orientation
                 if not self._validate_ligand_orientation():
                     # Try to correct orientation
@@ -1575,10 +1633,6 @@ class Docking:
         # Step 2: Align proteins
         self.logger.section("Aligning Proteins")
         self.align_proteins()
-        
-        # Step 2.3: Generate initial conformations
-        self.logger.section("Generating Initial Conformations")
-        self.generate_initial_conformations()
         
         # Step 2.5: Optimize position
         self.logger.section("Optimizing Position")

@@ -44,7 +44,7 @@ class EnergyCalculator:
         # Scoring parameters
         self.distance_penalty_coeff = distance_penalty_coeff  # kcal/mol per Å
         # Batch processing parameters
-        self.max_batch_size = 1000  # Maximum number of atoms per batch
+        self.max_batch_size = 10000  # Maximum number of atoms per batch
         self.min_batch_size = 100  # Minimum number of atoms per batch
         # Initialize logger
         self.logger = Logger()
@@ -105,42 +105,45 @@ class EnergyCalculator:
             epsilons.append(epsilon)
         return sigmas, epsilons
     
-    def _adjust_batch_size(self, num_atoms1: int, num_atoms2: int) -> int:
+    def calculate_batch_energy(self, receptor: Structure, ligands: List[Structure], include_vdw: bool = True, include_electrostatic: bool = True) -> List[Dict[str, float]]:
         """
-        Adjust batch size dynamically based on available GPU memory and calculation requirements.
+        Calculate energy for multiple ligand conformations in batch.
         
         Args:
-            num_atoms1 (int): Number of atoms in the first structure
-            num_atoms2 (int): Number of atoms in the second structure
+            receptor (Structure): Receptor protein structure
+            ligands (List[Structure]): List of ligand protein structures
+            include_vdw (bool, optional): Whether to include van der Waals energy
+            include_electrostatic (bool, optional): Whether to include electrostatic energy
             
         Returns:
-            int: Adjusted batch size
+            List[Dict[str, float]]: List of energy dictionaries for each ligand conformation
         """
-        if self.device.type != 'cuda' or self.available_memory is None:
-            # If not using GPU or memory info not available, use default batch size
-            return self.max_batch_size
+        results = []
         
-        # Calculate estimated memory usage per batch
-        # Each atom pair distance calculation requires (batch_size * num_atoms2) floats
-        # For VDW energy, we also need storage for sigmas, epsilons, and energy values
-        estimated_memory_per_batch = lambda batch_size: batch_size * num_atoms2 * 4 * 5  # 5 tensors per calculation
+        for ligand in ligands:
+            energies = {
+                'vdw': 0.0,
+                'electrostatic': 0.0,
+                'total': 0.0
+            }
+            
+            if include_vdw:
+                vdw_energy = self.calculate_vdw_energy(receptor, ligand)
+                energies['vdw'] = vdw_energy
+                energies['total'] += vdw_energy
+            
+            if include_electrostatic:
+                electrostatic_energy = self.calculate_electrostatic_energy(receptor, ligand)
+                energies['electrostatic'] = electrostatic_energy
+                energies['total'] += electrostatic_energy
+            
+            results.append(energies)
         
-        # Start with max batch size and adjust down until it fits in memory
-        batch_size = self.max_batch_size
-        while batch_size >= self.min_batch_size:
-            estimated_memory = estimated_memory_per_batch(batch_size)
-            if estimated_memory < self.available_memory * 0.8:  # Leave 20% memory for other operations
-                break
-            batch_size = int(batch_size * 0.7)  # Reduce batch size by 30%
-        
-        # Ensure batch size is at least min_batch_size
-        batch_size = max(batch_size, self.min_batch_size)
-        
-        return batch_size
+        return results
     
     def calculate_vdw_energy(self, receptor: Structure, ligand: Structure) -> float:
         """
-        Calculate van der Waals energy between receptor and ligand atoms using PyTorch with batch processing.
+        Calculate van der Waals energy between receptor and ligand atoms using PyTorch.
         
         Args:
             receptor (Structure): Receptor protein structure
@@ -149,7 +152,11 @@ class EnergyCalculator:
         Returns:
             float: Van der Waals energy in kcal/mol
         """
-        # Get atom types and VDW parameters first
+        # Calculate distances
+        distances = self._calculate_atom_pair_distances(receptor.coordinates, ligand.coordinates)
+        distances_nm = distances * 0.1  # Convert to nanometers
+        
+        # Get atom types and VDW parameters
         rec_atom_types = self._get_atom_types(receptor.atoms)
         lig_atom_types = self._get_atom_types(ligand.atoms)
         
@@ -158,76 +165,117 @@ class EnergyCalculator:
         
         # Convert to tensors and reshape for broadcasting
         # Use float32 to avoid overflow issues with float16
-        rec_sigmas = torch.tensor(rec_sigmas, dtype=torch.float32, device=self.device)
-        rec_epsilons = torch.tensor(rec_epsilons, dtype=torch.float32, device=self.device)
-        lig_sigmas = torch.tensor(lig_sigmas, dtype=torch.float32, device=self.device)
-        lig_epsilons = torch.tensor(lig_epsilons, dtype=torch.float32, device=self.device)
+        rec_sigmas = torch.tensor(rec_sigmas, dtype=torch.float32, device=self.device).unsqueeze(1)
+        rec_epsilons = torch.tensor(rec_epsilons, dtype=torch.float32, device=self.device).unsqueeze(1)
+        lig_sigmas = torch.tensor(lig_sigmas, dtype=torch.float32, device=self.device).unsqueeze(0)
+        lig_epsilons = torch.tensor(lig_epsilons, dtype=torch.float32, device=self.device).unsqueeze(0)
         
-        # Calculate mixing rules for all atom pairs
-        # We'll do this once upfront since it's not memory-intensive
-        sigma_ij = 0.5 * (rec_sigmas.unsqueeze(1) + lig_sigmas.unsqueeze(0))  # Lorentz mixing rule
-        epsilon_ij = torch.sqrt(rec_epsilons.unsqueeze(1) * lig_epsilons.unsqueeze(0))  # Berthelot mixing rule
+        # Apply mixing rules
+        sigma_ij = 0.5 * (rec_sigmas + lig_sigmas)  # Lorentz mixing rule
+        epsilon_ij = torch.sqrt(rec_epsilons * lig_epsilons)  # Berthelot mixing rule
         
-        # Apply distance cutoff (10 Å = 1.0 nm) - beyond this, VDW interactions are negligible
-        cutoff_nm = 1.0  # 10 Å
-        min_distance_nm = 0.1  # 1 Å - avoid extreme values
+        # Apply distance cutoff (1.2 Å = 0.12 nm) as requested
+        cutoff_nm = 0.12  # 1.2 Å
+        cutoff_mask = distances_nm < cutoff_nm
         
-        # Adjust batch size dynamically based on available memory
-        num_rec_atoms = len(receptor.atoms)
-        num_lig_atoms = len(ligand.atoms)
-        batch_size = self._adjust_batch_size(num_rec_atoms, num_lig_atoms)
-        self.logger.debug(f"Using batch size {batch_size} for VDW energy calculation")
+        # Clamp distances to avoid division by zero and overflow
+        min_distance_nm = 0.05  # 0.5 Å - avoid extreme values
+        clamped_distances = torch.clamp(distances_nm, min=min_distance_nm)
         
-        total_energy = 0.0
+        # Calculate LJ potential only for atoms within cutoff
+        sigma_over_r = sigma_ij / clamped_distances
+        vdw_energy = 4 * epsilon_ij * (sigma_over_r**12 - sigma_over_r**6)
         
-        # Process receptor atoms in batches
-        for start_idx in range(0, num_rec_atoms, batch_size):
-            # Calculate end index for this batch
-            end_idx = min(start_idx + batch_size, num_rec_atoms)
-            
-            # Get batch of receptor coordinates
-            rec_batch_coords = receptor.coordinates[start_idx:end_idx]
-            
-            # Calculate distances for this batch
-            distances = self._calculate_atom_pair_distances(rec_batch_coords, ligand.coordinates)
-            distances_nm = distances * 0.1  # Convert to nanometers
-            
-            # Apply cutoff mask
-            cutoff_mask = distances_nm < cutoff_nm
-            
-            # Clamp distances to avoid division by zero and overflow
-            clamped_distances = torch.clamp(distances_nm, min=min_distance_nm)
-            
-            # Get VDW parameters for this batch
-            batch_sigma_ij = sigma_ij[start_idx:end_idx]
-            batch_epsilon_ij = epsilon_ij[start_idx:end_idx]
-            
-            # Calculate LJ potential only for atoms within cutoff
-            sigma_over_r = batch_sigma_ij / clamped_distances
-            vdw_energy = 4 * batch_epsilon_ij * (sigma_over_r**12 - sigma_over_r**6)
-            
-            # Apply cutoff mask
-            vdw_energy = vdw_energy * cutoff_mask.float()
-            
-            # Clip extreme values to prevent overflow
-            vdw_energy = torch.clamp(vdw_energy, -10000.0, 10000.0)
-            
-            # Convert from kJ/mol to kcal/mol
-            vdw_energy = vdw_energy * 0.239
-            
-            # Add to total energy
-            batch_energy = torch.sum(vdw_energy).item()
-            total_energy += batch_energy
-            
-            # Clear cache to free up memory
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+        # Apply cutoff mask
+        vdw_energy = vdw_energy * cutoff_mask.float()
+        
+        # Clip extreme values to prevent overflow
+        vdw_energy = torch.clamp(vdw_energy, -10000.0, 10000.0)
+        
+        # Convert from kJ/mol to kcal/mol
+        vdw_energy = vdw_energy * 0.239
+        
+        total_energy = torch.sum(vdw_energy).item()
         
         return float(total_energy)
     
+    def calculate_vdw_forces(self, receptor: Structure, ligand: Structure) -> torch.Tensor:
+        """
+        Calculate van der Waals forces between receptor and ligand atoms.
+        
+        Args:
+            receptor (Structure): Receptor protein structure
+            ligand (Structure): Ligand protein structure
+            
+        Returns:
+            torch.Tensor: Forces on ligand atoms (shape: [num_ligand_atoms, 3])
+        """
+        # Calculate distances and distance vectors
+        rec_coords = receptor.coordinates
+        lig_coords = ligand.coordinates
+        
+        # Expand dimensions for broadcasting
+        rec_coords_expanded = rec_coords.unsqueeze(1)  # [num_rec_atoms, 1, 3]
+        lig_coords_expanded = lig_coords.unsqueeze(0)  # [1, num_lig_atoms, 3]
+        
+        # Calculate distance vectors (receptor -> ligand)
+        distance_vectors = lig_coords_expanded - rec_coords_expanded  # [num_rec_atoms, num_lig_atoms, 3]
+        distances = torch.norm(distance_vectors, dim=2)  # [num_rec_atoms, num_lig_atoms]
+        distances_nm = distances * 0.1  # Convert to nanometers
+        
+        # Apply cutoff (1.2 Å = 0.12 nm)
+        cutoff_nm = 0.12
+        cutoff_mask = distances_nm < cutoff_nm
+        
+        # Get VDW parameters
+        rec_atom_types = self._get_atom_types(receptor.atoms)
+        lig_atom_types = self._get_atom_types(ligand.atoms)
+        
+        rec_sigmas, rec_epsilons = self._get_vdw_parameters(rec_atom_types)
+        lig_sigmas, lig_epsilons = self._get_vdw_parameters(lig_atom_types)
+        
+        # Convert to tensors and reshape for broadcasting
+        rec_sigmas = torch.tensor(rec_sigmas, dtype=torch.float32, device=self.device).unsqueeze(1)
+        rec_epsilons = torch.tensor(rec_epsilons, dtype=torch.float32, device=self.device).unsqueeze(1)
+        lig_sigmas = torch.tensor(lig_sigmas, dtype=torch.float32, device=self.device).unsqueeze(0)
+        lig_epsilons = torch.tensor(lig_epsilons, dtype=torch.float32, device=self.device).unsqueeze(0)
+        
+        # Apply mixing rules
+        sigma_ij = 0.5 * (rec_sigmas + lig_sigmas)
+        epsilon_ij = torch.sqrt(rec_epsilons * lig_epsilons)
+        
+        # Clamp distances to avoid division by zero
+        min_distance_nm = 0.05
+        clamped_distances = torch.clamp(distances_nm, min=min_distance_nm)
+        
+        # Calculate LJ force magnitude
+        # F = -dU/dr
+        # U = 4ε[(σ/r)^12 - (σ/r)^6]
+        # F = 4ε[12(σ^12/r^13) - 6(σ^6/r^7)]
+        sigma_over_r = sigma_ij / clamped_distances
+        force_magnitude = 4 * epsilon_ij * (12 * (sigma_over_r ** 12) / clamped_distances - 6 * (sigma_over_r ** 6) / clamped_distances)
+        
+        # Apply cutoff mask
+        force_magnitude = force_magnitude * cutoff_mask.float()
+        
+        # Convert to kcal/(mol·Å) from kJ/(mol·nm)
+        force_magnitude = force_magnitude * 0.239 / 0.1  # kJ to kcal, nm to Å
+        
+        # Calculate force vectors
+        # Normalize distance vectors (avoid division by zero)
+        distances_safe = torch.clamp(distances, min=1e-6)
+        normalized_distance_vectors = distance_vectors / distances_safe.unsqueeze(2)
+        
+        # Calculate forces on ligand atoms
+        # Force on ligand atom = sum over all receptor atoms of (force_magnitude * normalized_distance_vector)
+        # Note: Force direction is repulsive when atoms are too close, attractive when at optimal distance
+        ligand_forces = torch.sum(force_magnitude.unsqueeze(2) * normalized_distance_vectors, dim=0)
+        
+        return ligand_forces
+    
     def calculate_electrostatic_energy(self, receptor: Structure, ligand: Structure, cutoff: float = 1.2) -> float:
         """
-        Calculate electrostatic energy between receptor and ligand atoms using PyTorch with batch processing.
+        Calculate electrostatic energy between receptor and ligand atoms using PyTorch.
         
         Args:
             receptor (Structure): Receptor protein structure
@@ -237,7 +285,17 @@ class EnergyCalculator:
         Returns:
             float: Electrostatic energy in kcal/mol
         """
-        # Get charges for atoms first
+        # Calculate distances
+        distances = self._calculate_atom_pair_distances(receptor.coordinates, ligand.coordinates)
+        
+        # Add epsilon to prevent division by zero
+        epsilon = torch.tensor(0.001, device=self.device, dtype=torch.float32)
+        distances = torch.max(distances, epsilon)
+        
+        # Apply cutoff
+        cutoff_mask = distances > cutoff
+        
+        # Get charges for atoms
         def get_charges(atoms):
             charges = []
             for atom in atoms:
@@ -246,62 +304,127 @@ class EnergyCalculator:
             return charges
         
         rec_charges = torch.tensor(get_charges(receptor.atoms), 
-                                  device=self.device, dtype=torch.float32)
+                                  device=self.device, dtype=torch.float32).unsqueeze(1)
         lig_charges = torch.tensor(get_charges(ligand.atoms), 
-                                  device=self.device, dtype=torch.float32)
+                                  device=self.device, dtype=torch.float32).unsqueeze(0)
         
-        # Add epsilon to prevent division by zero
-        epsilon = torch.tensor(0.001, device=self.device, dtype=torch.float32)
+        # Calculate electrostatic energy
+        k = 332.0  # Conversion factor (kcal·Å/(mol·e²))
+        electrostatic_energy = k * rec_charges * lig_charges / distances
         
-        # Conversion factor (kcal·Å/(mol·e²))
-        k = 332.0
+        # Apply cutoff mask and clip values
+        electrostatic_energy = electrostatic_energy * cutoff_mask.float()
+        electrostatic_energy = torch.clamp(electrostatic_energy, -10000.0, 10000.0)
         
-        # Adjust batch size dynamically based on available memory
-        num_rec_atoms = len(receptor.atoms)
-        num_lig_atoms = len(ligand.atoms)
-        batch_size = self._adjust_batch_size(num_rec_atoms, num_lig_atoms)
-        self.logger.debug(f"Using batch size {batch_size} for electrostatic energy calculation")
+        return float(torch.sum(electrostatic_energy).item())
+    
+    def calculate_electrostatic_forces(self, receptor: Structure, ligand: Structure, cutoff: float = 1.2) -> torch.Tensor:
+        """
+        Calculate electrostatic forces between receptor and ligand atoms.
         
-        total_energy = 0.0
+        Args:
+            receptor (Structure): Receptor protein structure
+            ligand (Structure): Ligand protein structure
+            cutoff (float, optional): Minimum distance cutoff (Å)
+            
+        Returns:
+            torch.Tensor: Forces on ligand atoms (shape: [num_ligand_atoms, 3])
+        """
+        rec_coords = receptor.coordinates
+        lig_coords = ligand.coordinates
         
-        # Process receptor atoms in batches
-        for start_idx in range(0, num_rec_atoms, batch_size):
-            # Calculate end index for this batch
-            end_idx = min(start_idx + batch_size, num_rec_atoms)
-            
-            # Get batch of receptor coordinates and charges
-            rec_batch_coords = receptor.coordinates[start_idx:end_idx]
-            rec_batch_charges = rec_charges[start_idx:end_idx]
-            
-            # Calculate distances for this batch
-            distances = self._calculate_atom_pair_distances(rec_batch_coords, ligand.coordinates)
-            
-            # Prevent division by zero
-            distances = torch.max(distances, epsilon)
-            
-            # Apply cutoff
-            cutoff_mask = distances > cutoff
-            
-            # Calculate electrostatic energy for this batch
-            # Reshape charges for broadcasting
-            rec_batch_charges_reshaped = rec_batch_charges.unsqueeze(1)
-            lig_charges_reshaped = lig_charges.unsqueeze(0)
-            
-            electrostatic_energy = k * rec_batch_charges_reshaped * lig_charges_reshaped / distances
-            
-            # Apply cutoff mask and clip values
-            electrostatic_energy = electrostatic_energy * cutoff_mask.float()
-            electrostatic_energy = torch.clamp(electrostatic_energy, -10000.0, 10000.0)
-            
-            # Add to total energy
-            batch_energy = torch.sum(electrostatic_energy).item()
-            total_energy += batch_energy
-            
-            # Clear cache to free up memory
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+        # Expand dimensions for broadcasting
+        rec_coords_expanded = rec_coords.unsqueeze(1)  # [num_rec_atoms, 1, 3]
+        lig_coords_expanded = lig_coords.unsqueeze(0)  # [1, num_lig_atoms, 3]
         
-        return float(total_energy)
+        # Calculate distance vectors and distances
+        distance_vectors = lig_coords_expanded - rec_coords_expanded  # [num_rec_atoms, num_lig_atoms, 3]
+        distances = torch.norm(distance_vectors, dim=2)  # [num_rec_atoms, num_lig_atoms]
+        
+        # Apply cutoff (only include distances > cutoff)
+        cutoff_mask = distances > cutoff
+        
+        # Avoid division by zero
+        epsilon = torch.tensor(0.001, device=self.device)
+        distances = torch.max(distances, epsilon)
+        
+        # Get charges
+        def get_charges(atoms):
+            charges = []
+            for atom in atoms:
+                charge = self.force_field.get_atom_charge(atom.res_name, atom.atom_name)
+                charges.append(charge)
+            return charges
+        
+        rec_charges = torch.tensor(get_charges(receptor.atoms), device=self.device, dtype=torch.float32).unsqueeze(1)
+        lig_charges = torch.tensor(get_charges(ligand.atoms), device=self.device, dtype=torch.float32).unsqueeze(0)
+        
+        # Calculate electrostatic force magnitude
+        # F = -dU/dr
+        # U = k * q1 * q2 / r
+        # F = k * q1 * q2 / r^2
+        k = 332.0  # kcal·Å/(mol·e²)
+        force_magnitude = k * rec_charges * lig_charges / (distances ** 2)
+        
+        # Apply cutoff mask
+        force_magnitude = force_magnitude * cutoff_mask.float()
+        
+        # Calculate force vectors
+        normalized_distance_vectors = distance_vectors / distances.unsqueeze(2)
+        electrostatic_forces = force_magnitude.unsqueeze(2) * normalized_distance_vectors
+        
+        # Sum forces from all receptor atoms for each ligand atom
+        total_electrostatic_forces = torch.sum(electrostatic_forces, dim=0)
+        
+        return total_electrostatic_forces
+    
+    def calculate_total_forces(self, receptor: Structure, ligand: Structure, 
+                              rec_group_indices: List[int], lig_group_indices: List[int],
+                              bias_strength: float = 100.0) -> torch.Tensor:
+        """
+        Calculate total forces on ligand atoms, including only VDW and bias forces.
+        Bias force increases with distance and is always stronger than VDW forces.
+        
+        Args:
+            receptor (Structure): Receptor protein structure
+            ligand (Structure): Ligand protein structure
+            rec_group_indices (List[int]): Receptor target residue group indices
+            lig_group_indices (List[int]): Ligand target residue group indices
+            bias_strength (float, optional): Base strength of bias force towards target residue group
+            
+        Returns:
+            torch.Tensor: Total forces on ligand atoms (shape: [num_ligand_atoms, 3])
+        """
+        # Calculate VDW forces
+        vdw_forces = self.calculate_vdw_forces(receptor, ligand)
+        
+        # Calculate bias force towards receptor target group
+        # Get centers of target groups
+        rec_group_center = torch.mean(receptor.coordinates[rec_group_indices], dim=0)
+        lig_group_center = torch.mean(ligand.coordinates[lig_group_indices], dim=0)
+        
+        # Calculate current distance between residue groups
+        current_distance = torch.norm(rec_group_center - lig_group_center).item()
+        
+        # Calculate bias direction (ligand group -> receptor group)
+        bias_direction = rec_group_center - lig_group_center
+        bias_direction = bias_direction / torch.norm(bias_direction)
+
+        # Make bias force increase with distance - the farther away, the stronger the bias
+        # Distance-based bias: bias strength = base_strength * (1 + current_distance / 10.0)
+        distance_based_bias = bias_strength * current_distance * 4
+        
+        # Ensure bias force is always stronger than VDW forces
+        effective_bias_strength = distance_based_bias**1.5 
+        
+        # Apply bias force to all ligand atoms (pointing towards receptor target group)
+        bias_force = bias_direction * effective_bias_strength
+        bias_forces = torch.ones(ligand.coordinates.shape[0], 3, device=self.device) * bias_force
+        
+        # Calculate total force - only VDW + bias (no electrostatic)
+        total_forces = vdw_forces + bias_forces
+        
+        return total_forces
     
     def calculate_distance_penalty(self, rec_group_center: torch.Tensor, 
                                   lig_group_center: torch.Tensor) -> float:
