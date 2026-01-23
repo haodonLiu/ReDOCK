@@ -1,34 +1,13 @@
 {
-  "debug": false,
-  "mode": "dock",
-  "input_file": null,
-  "output_file": null,
-  "dx": 0.0,
-  "dy": 0.0,
-  "dz": 0.0,
-  "receptor_file": "data\\structure\\triP-KD_AKT1.pdb",
-  "ligand_file": "data\\structure\\PP5_CD.pdb",
-  "receptor_chains": [],
-  "ligand_chains": [],
-  "receptor_residues": [
-    "A:307",
-    "A:308",
-    "A:309"
-  ],
-  "ligand_residues": [
-    "B:275",
-    "B:427",
-    "B:451",
-    "C:501",
-    "C:502"
-  ],
-  "force_field": "data\\force_field\\ff14SB.xml",
-  "max_dist": 5.0,
-  "num_rotations": 36,
-  "use_gpu": true,
-  "step_size": 1.0,
-  "solvent_penalty_coeff": 0.1,
-  "distance_penalty_coeff": 0.5,
-  "save_all": false,
-  "num_output_confs": 10
+  "input_type": "complex",
+  "complex_files": ["data/structure/AKT_PP5_start.pdb"],
+  "receptor_chains": ["A","B","D"],
+  "ligand_chains": ["E","C"],
+  "receptor_residues": ["A:308"],
+  "ligand_residues": ["C:501", "C:502"],
+  "min_dist": 5.0,
+  "max_dist": 8.0,
+  "step_size": 2.0,
+  "num_rotations": 10,
+  "output_file": "results/308/complex.pdb"
 }

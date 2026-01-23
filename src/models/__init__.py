@@ -6,10 +6,11 @@ PDB Model Package
 Provides data models for PDB structure, atom, chain, and residue.
 """
 
-from .structure import Structure
-from .atom import PDBAtom
-from .chain import Chain
-from .residue import Residue
+from .topology import Topology
+from .coordinate import Coordinate
 from .force_field import ForceField
+from .structure.atom import Atom
+from .structure.chain import Chain
+from .structure.residue import Residue
 
-__all__ = ['Structure', 'PDBAtom', 'Chain', 'Residue', 'ForceField']
+__all__ = ['Topology', 'Coordinate', 'Atom', 'Chain', 'Residue', 'ForceField']

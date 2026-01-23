@@ -6,9 +6,10 @@ PDB Coordinate Manager
 Handles coordinate manipulation for PDB structures.
 """
 
-import math
 import torch
-from src.models.structure import Structure
+from ..models.coordinate import Coordinate
+from ..utils.coordinate_utils import translate_coordinates as utils_translate_coords
+from ..utils.coordinate_utils import rotate_around_axis as utils_rotate_around_axis
 
 
 class CoordinateManager:
@@ -16,11 +17,11 @@ class CoordinateManager:
     Coordinate manager for handling atom coordinate operations.
     
     Attributes:
-        structure (Structure): The structure to manage coordinates for
+        coordinate (Coordinate): The coordinate object to manage
         device (torch.device): Device for PyTorch calculations (CPU or GPU)
     """
-    def __init__(self, structure: Structure, device: torch.device = torch.device("cuda")):
-        self.structure = structure
+    def __init__(self, coordinate: Coordinate, device: torch.device = torch.device("cuda")):
+        self.coordinate = coordinate
         self.device = device
     
     def translate_coordinates(self, translation: torch.Tensor) -> None:
@@ -31,10 +32,10 @@ class CoordinateManager:
             translation (torch.Tensor): 3-element tensor containing [dx, dy, dz]
         """
         # Ensure both coordinates and translation are on the correct device
-        coords = self.structure.coordinates.to(self.device)
+        coords = self.coordinate.coordinates.to(self.device)
         translation = translation.to(self.device)
-        # Directly update the tensor coordinates
-        self.structure.coordinates = coords + translation
+        # Use utils function to translate coordinates
+        self.coordinate.coordinates = utils_translate_coords(coords, translation)
     
     def rotate_around_axis(self, axis: torch.Tensor, angle: float, center: torch.Tensor) -> None:
         """
@@ -46,50 +47,9 @@ class CoordinateManager:
             center (torch.Tensor): Rotation center
         """
         # Ensure all tensors are on the correct device
-        coords = self.structure.coordinates.to(self.device)
+        coords = self.coordinate.coordinates.to(self.device)
         axis = axis.to(self.device)
         center = center.to(self.device)
         
-        # Normalize axis
-        axis = axis / torch.norm(axis)
-        
-        # Convert angle to radians with higher precision
-        angle_rad = torch.tensor(math.radians(angle), device=self.device, dtype=torch.float32)
-        
-        # Translate coordinates to origin
-        coords_translated = coords - center
-        
-        # Calculate rotation matrix using PyTorch with higher precision
-        ux, uy, uz = axis
-        cos_theta = torch.cos(angle_rad)
-        sin_theta = torch.sin(angle_rad)
-        
-        # Rotation matrix components
-        r11 = cos_theta + ux**2 * (1 - cos_theta)
-        r12 = ux*uy*(1 - cos_theta) - uz*sin_theta
-        r13 = ux*uz*(1 - cos_theta) + uy*sin_theta
-        r21 = uy*ux*(1 - cos_theta) + uz*sin_theta
-        r22 = cos_theta + uy**2 * (1 - cos_theta)
-        r23 = uy*uz*(1 - cos_theta) - ux*sin_theta
-        r31 = uz*ux*(1 - cos_theta) - uy*sin_theta
-        r32 = uz*uy*(1 - cos_theta) + ux*sin_theta
-        r33 = cos_theta + uz**2 * (1 - cos_theta)
-        
-        # Rotation matrix
-        rotation_matrix = torch.stack([
-            torch.stack([r11, r12, r13]),
-            torch.stack([r21, r22, r23]),
-            torch.stack([r31, r32, r33])
-        ])
-        
-        # Apply rotation with higher precision
-        coords_translated = coords_translated.to(torch.float32)
-        rotation_matrix = rotation_matrix.to(torch.float32)
-        coords_rotated = torch.matmul(coords_translated, rotation_matrix)
-        
-        # Translate back and convert to original dtype
-        coords_final = coords_rotated + center
-        coords_final = coords_final.to(self.structure.coordinates.dtype)
-        
-        # Directly update the tensor coordinates
-        self.structure.coordinates = coords_final
+        # Use utils function to rotate coordinates
+        self.coordinate.coordinates = utils_rotate_around_axis(coords, axis, angle, center)

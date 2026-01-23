@@ -8,7 +8,7 @@ Defines the Chain class for storing protein chain information.
 
 from typing import List, Optional
 from .residue import Residue
-from .atom import PDBAtom
+from .atom import Atom
 import torch
 
 
@@ -29,7 +29,7 @@ class Chain:
         self.atoms = []     # List of all atoms in the chain
         self.coordinates = torch.empty(0, 3, dtype=torch.float16)
         self.total_charge = 0.0
-    
+
     def add_residue(self, residue: Residue) -> None:
         """
         Add a residue to the chain.
@@ -48,6 +48,8 @@ class Chain:
         
         # Update total charge
         self.total_charge += residue.total_charge
+    
+
     
     def get_residue(self, res_seq: int) -> Optional[Residue]:
         """
@@ -70,7 +72,7 @@ class Chain:
         """
         return [self.residues[res_seq] for res_seq in sorted(self.residues.keys())]
     
-    def get_atoms(self) -> List[PDBAtom]:
+    def get_atoms(self) -> List[Atom]:
         """
         Get all atoms in the chain.
         

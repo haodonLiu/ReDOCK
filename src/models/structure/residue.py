@@ -7,7 +7,7 @@ Defines the Residue class for storing protein residue information.
 """
 
 from typing import List, Optional
-from .atom import PDBAtom
+from .atom import Atom
 import torch
 
 
@@ -32,13 +32,13 @@ class Residue:
         self.atoms = []     # List of all atoms in the residue
         self.coordinates = torch.empty(0, 3, dtype=torch.float16)
         self.total_charge = 0.0
-    
-    def add_atom(self, atom: PDBAtom, coordinates: torch.Tensor) -> None:
+
+    def add_atom(self, atom: Atom, coordinates: torch.Tensor) -> None:
         """
         Add an atom to the residue.
         
         Args:
-            atom (PDBAtom): Atom to add to the residue
+            atom (Atom): Atom to add to the residue
             coordinates (torch.Tensor): Atom coordinates as a tensor
         """
         self.atoms.append(atom)
@@ -47,40 +47,12 @@ class Residue:
         self.coordinates = torch.cat([self.coordinates, coordinates.unsqueeze(0)], dim=0)
         
         # Update total charge
-        atom_charge = self._parse_atom_charge(atom.charge)
-        self.total_charge += atom_charge
+        # Since we're not parsing charge from atom.charge anymore, just use 0.0
+        self.total_charge += 0.0
     
-    def _parse_atom_charge(self, charge_str: str) -> float:
-        """
-        Parse atom charge from string to float.
-        
-        Args:
-            charge_str (str): Charge string from PDB file
-            
-        Returns:
-            float: Parsed charge value
-        """
-        if not charge_str:
-            return 0.0
-        
-        try:
-            # PDB charge format: e.g., "  +1", "  -2", "+3", "-1"
-            # Remove whitespace and convert to float
-            return float(charge_str.strip())
-        except ValueError:
-            # If parsing fails, try to interpret common charge formats
-            charge_str = charge_str.strip()
-            if charge_str == '+':
-                return 1.0
-            elif charge_str == '-':
-                return -1.0
-            elif charge_str == '++':
-                return 2.0
-            elif charge_str == '--':
-                return -2.0
-            return 0.0
+
     
-    def get_atom(self, atom_name: str) -> Optional[PDBAtom]:
+    def get_atom(self, atom_name: str) -> Optional[Atom]:
         """
         Get an atom by its name.
         
@@ -95,7 +67,7 @@ class Residue:
                 return atom
         return None
     
-    def get_atoms(self) -> List[PDBAtom]:
+    def get_atoms(self) -> List[Atom]:
         """
         Get all atoms in the residue.
         

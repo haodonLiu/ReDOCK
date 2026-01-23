@@ -7,17 +7,18 @@ Provides utility functions for structure-related operations that can be shared a
 """
 
 from typing import List
-from src.models.structure import Structure
-from src.models.atom import PDBAtom
+from src.models.topology import Topology
+from src.models.coordinate import Coordinate
+from src.models.structure.atom import Atom
 from src.utils.logger import Logger
 
 
-def residues_to_atom_indices(structure: Structure, residue_ids: List[str], logger: Logger = None) -> List[int]:
+def residues_to_atom_indices(topology: Topology, residue_ids: List[str], logger: Logger = None) -> List[int]:
     """
     Convert residue IDs to atom indices.
     
     Args:
-        structure (Structure): Protein structure
+        topology (Topology): Protein topology
         residue_ids (List[str]): List of residue IDs in format "chain:residue"
         logger (Logger, optional): Logger instance for error logging
         
@@ -35,7 +36,7 @@ def residues_to_atom_indices(structure: Structure, residue_ids: List[str], logge
             res_seq = int(res_seq)
             
             # Find all atoms in this residue
-            for i, atom in enumerate(structure.atoms):
+            for i, atom in enumerate(topology.atoms):
                 if atom.chain_id == chain_id and atom.res_seq == res_seq:
                     atom_indices.append(i)
         except Exception as e:
@@ -47,16 +48,3 @@ def residues_to_atom_indices(structure: Structure, residue_ids: List[str], logge
     
     return atom_indices
 
-
-def calculate_structure_center(structure: Structure) -> List[float]:
-    """
-    Calculate the geometric center of a structure.
-    
-    Args:
-        structure (Structure): Protein structure
-        
-    Returns:
-        List[float]: Center coordinates as [x, y, z]
-    """
-    center = structure.calculate_geometric_center()
-    return [float(center[0]), float(center[1]), float(center[2])]
