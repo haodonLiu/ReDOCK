@@ -12,6 +12,7 @@ Handles coordinate-related calculations for protein structures, including:
 
 import torch
 from typing import List, Tuple
+from ..models.coordinate import Coordinate
 
 
 def calculate_geometric_center(coordinates: torch.Tensor) -> torch.Tensor:
@@ -38,7 +39,10 @@ def translate_coordinates(coordinates: torch.Tensor, translation_vector: torch.T
     Returns:
         torch.Tensor: Translated coordinates (shape: [num_atoms, 3])
     """
-    return coordinates + translation_vector
+    coord_obj = Coordinate()
+    coord_obj.coordinates = coordinates.clone()
+    coord_obj.translate(translation_vector)
+    return coord_obj.coordinates
 
 
 def center_coordinates(coordinates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -104,7 +108,11 @@ def rotate_coordinates(coordinates: torch.Tensor, rotation_matrix: torch.Tensor)
     Returns:
         torch.Tensor: Rotated coordinates (shape: [num_atoms, 3])
     """
-    return torch.matmul(coordinates, rotation_matrix.T)
+    coord_obj = Coordinate()
+    coord_obj.coordinates = coordinates.clone()
+    # 由于原函数没有center参数，我们将其设为None，让Coordinate类自己计算中心点
+    coord_obj.rotate(rotation_matrix)
+    return coord_obj.coordinates
 
 
 def rotate_coordinates_euler(coordinates: torch.Tensor, angle_x: float, angle_y: float, angle_z: float) -> torch.Tensor:
@@ -120,8 +128,14 @@ def rotate_coordinates_euler(coordinates: torch.Tensor, angle_x: float, angle_y:
     Returns:
         torch.Tensor: Rotated coordinates (shape: [num_atoms, 3])
     """
-    rotation_matrix = create_rotation_matrix(angle_x, angle_y, angle_z)
-    return rotate_coordinates(coordinates, rotation_matrix)
+    coord_obj = Coordinate()
+    coord_obj.coordinates = coordinates.clone()
+    # Coordinate类的rotate_euler方法接受角度制，而原函数接受弧度制，需要转换
+    angle_x_deg = torch.rad2deg(torch.tensor(angle_x)).item()
+    angle_y_deg = torch.rad2deg(torch.tensor(angle_y)).item()
+    angle_z_deg = torch.rad2deg(torch.tensor(angle_z)).item()
+    coord_obj.rotate_euler(angle_x_deg, angle_y_deg, angle_z_deg)
+    return coord_obj.coordinates
 
 
 def calculate_rmsd(coordinates1: torch.Tensor, coordinates2: torch.Tensor) -> float:
@@ -240,47 +254,7 @@ def rotate_around_axis(coordinates: torch.Tensor, axis: torch.Tensor, angle: flo
     Returns:
         torch.Tensor: Rotated coordinates (shape: [num_atoms, 3])
     """
-    import math
-    
-    # Normalize axis
-    axis = axis / torch.norm(axis)
-    
-    # Convert angle to radians
-    angle_rad = torch.tensor(math.radians(angle), dtype=torch.float32, device=coordinates.device)
-    
-    # Translate coordinates to origin
-    coords_translated = coordinates - center
-    
-    # Calculate rotation matrix
-    ux, uy, uz = axis
-    cos_theta = torch.cos(angle_rad)
-    sin_theta = torch.sin(angle_rad)
-    
-    # Rotation matrix components
-    r11 = cos_theta + ux**2 * (1 - cos_theta)
-    r12 = ux*uy*(1 - cos_theta) - uz*sin_theta
-    r13 = ux*uz*(1 - cos_theta) + uy*sin_theta
-    r21 = uy*ux*(1 - cos_theta) + uz*sin_theta
-    r22 = cos_theta + uy**2 * (1 - cos_theta)
-    r23 = uy*uz*(1 - cos_theta) - ux*sin_theta
-    r31 = uz*ux*(1 - cos_theta) - uy*sin_theta
-    r32 = uz*uy*(1 - cos_theta) + ux*sin_theta
-    r33 = cos_theta + uz**2 * (1 - cos_theta)
-    
-    # Rotation matrix
-    rotation_matrix = torch.stack([
-        torch.stack([r11, r12, r13]),
-        torch.stack([r21, r22, r23]),
-        torch.stack([r31, r32, r33])
-    ])
-    
-    # Apply rotation
-    coords_translated = coords_translated.to(torch.float32)
-    rotation_matrix = rotation_matrix.to(torch.float32)
-    coords_rotated = torch.matmul(coords_translated, rotation_matrix)
-    
-    # Translate back and convert to original dtype
-    coords_final = coords_rotated + center
-    coords_final = coords_final.to(coordinates.dtype)
-    
-    return coords_final
+    coord_obj = Coordinate()
+    coord_obj.coordinates = coordinates.clone()
+    coord_obj.rotate_around_axis(axis, angle, center)
+    return coord_obj.coordinates

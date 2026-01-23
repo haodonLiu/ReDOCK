@@ -8,8 +8,6 @@ Handles coordinate manipulation for PDB structures.
 
 import torch
 from ..models.coordinate import Coordinate
-from ..utils.coordinate_utils import translate_coordinates as utils_translate_coords
-from ..utils.coordinate_utils import rotate_around_axis as utils_rotate_around_axis
 
 
 class CoordinateManager:
@@ -31,11 +29,10 @@ class CoordinateManager:
         Args:
             translation (torch.Tensor): 3-element tensor containing [dx, dy, dz]
         """
-        # Ensure both coordinates and translation are on the correct device
-        coords = self.coordinate.coordinates.to(self.device)
+        # Ensure translation is on the correct device
         translation = translation.to(self.device)
-        # Use utils function to translate coordinates
-        self.coordinate.coordinates = utils_translate_coords(coords, translation)
+        # Directly call Coordinate class's translate method
+        self.coordinate.translate(translation)
     
     def rotate_around_axis(self, axis: torch.Tensor, angle: float, center: torch.Tensor) -> None:
         """
@@ -47,9 +44,8 @@ class CoordinateManager:
             center (torch.Tensor): Rotation center
         """
         # Ensure all tensors are on the correct device
-        coords = self.coordinate.coordinates.to(self.device)
         axis = axis.to(self.device)
         center = center.to(self.device)
         
-        # Use utils function to rotate coordinates
-        self.coordinate.coordinates = utils_rotate_around_axis(coords, axis, angle, center)
+        # Directly call Coordinate class's rotate_around_axis method
+        self.coordinate.rotate_around_axis(axis, angle, center)

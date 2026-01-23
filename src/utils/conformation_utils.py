@@ -32,23 +32,20 @@ def generate_random_conformation(original_top: Topology, original_coord: Coordin
     Returns:
         Tuple[Topology, Coordinate]: Randomly generated conformation as (topology, coordinate) tuple
     """
-    from .coordinate_utils import rotate_coordinates_euler, translate_coordinates, generate_random_translation
-    import math
+    from .coordinate_utils import generate_random_translation
     
-    # Generate random rotation angles (converted to radians)
-    angle_x = (torch.rand(1).item() - 0.5) * 2 * max_rotation * math.pi / 180.0
-    angle_y = (torch.rand(1).item() - 0.5) * 2 * max_rotation * math.pi / 180.0
-    angle_z = (torch.rand(1).item() - 0.5) * 2 * max_rotation * math.pi / 180.0
+    # Generate random rotation angles (in degrees, since Coordinate.rotate_euler uses degrees)
+    angle_x = (torch.rand(1).item() - 0.5) * 2 * max_rotation
+    angle_y = (torch.rand(1).item() - 0.5) * 2 * max_rotation
+    angle_z = (torch.rand(1).item() - 0.5) * 2 * max_rotation
     
     # Generate random translation
     translation = generate_random_translation(max_translation)
     
-    # Apply rotation and translation
-    rotated_coords = rotate_coordinates_euler(original_coord.coordinates, angle_x, angle_y, angle_z)
-    transformed_coords = translate_coordinates(rotated_coords, translation)
-    
-    # Create new coordinate with transformed coordinates
-    new_coord = Coordinate(transformed_coords)
+    # Create a copy of the original coordinates and apply transformations
+    new_coord = original_coord.copy()
+    new_coord.rotate_euler(angle_x, angle_y, angle_z)
+    new_coord.translate(translation)
     
     return (original_top, new_coord)
 
